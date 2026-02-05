@@ -268,7 +268,7 @@ with filter_col:
 
     st.markdown("### Filters")
 
-    client = st.selectbox("Client", ["Cover Whale"], index=0)
+    
     sel_state = st.selectbox("State", states, index=0)
     sel_year = st.selectbox("Accident Year", years, index=0)
     sel_adjuster = st.selectbox("Adjuster", adjusters, index=0)
