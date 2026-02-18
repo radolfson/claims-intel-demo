@@ -1,9 +1,6 @@
-import base64
 import os
-from dataclasses import dataclass
+from datetime import date
 from typing import Any, Dict, Optional, Tuple
-
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -31,7 +28,6 @@ h1,h2,h3,h4,h5,h6 {{
 .block-container {{
   max-width: 1400px;
 }}
-
 .sticky-filter {{
   position: sticky;
   top: 80px;
@@ -41,7 +37,6 @@ h1,h2,h3,h4,h5,h6 {{
   border: 1px solid rgba(0,0,0,0.08);
   border-radius: 12px;
 }}
-
 .card {{
   background: white;
   border: 1px solid rgba(0,0,0,0.08);
@@ -57,9 +52,6 @@ hr {{
   border-top: 1px solid rgba(0,0,0,0.08);
   margin: 12px 0;
 }}
-code {{
-  font-size: 0.9em;
-}}
 </style>
 """,
     unsafe_allow_html=True,
@@ -67,7 +59,7 @@ code {{
 
 
 # ============================================================
-# SETTINGS HELPERS (Secrets -> Env)
+# SETTINGS
 # ============================================================
 def get_setting(key: str, default: Any = None) -> Any:
     """Prefer Streamlit secrets, fall back to env vars."""
@@ -80,13 +72,11 @@ def get_setting(key: str, default: Any = None) -> Any:
 
 
 def get_data_source() -> str:
-    src = get_setting("DATA_SOURCE", "csv")
-    return str(src).lower().strip()
+    return str(get_setting("DATA_SOURCE", "csv")).lower().strip()
 
 
 SOURCE = get_data_source()
 DATA_PATH = os.getenv("DEMO_DATA_PATH", "demo_features_latest.csv")
-LOGO_PATH = os.getenv("NARS_LOGO_PATH", "narslogo.jpg")
 
 
 # ============================================================
@@ -108,12 +98,6 @@ def fmt_money_short(x: float) -> str:
     return f"${x:,.0f}"
 
 
-def pct_change(new: float, old: float) -> Optional[float]:
-    if old is None or old == 0:
-        return None
-    return (new - old) / old
-
-
 def fmt_delta(new: float, old: Optional[float], is_money: bool = False) -> str:
     if old is None:
         return "no prior comparison available"
@@ -122,145 +106,11 @@ def fmt_delta(new: float, old: Optional[float], is_money: bool = False) -> str:
     if old == 0 and new != 0:
         return f"new activity to {fmt_money(new) if is_money else f'{int(new):,}'}"
 
-    p = pct_change(new, old)
     direction = "up" if new > old else "down" if new < old else "flat"
-    if p is None:
+    pct = (new - old) / old if old else None
+    if pct is None:
         return f"{direction} to {fmt_money(new) if is_money else f'{int(new):,}'}"
-    return f"{direction} {abs(p)*100:,.1f}% to {fmt_money(new) if is_money else f'{int(new):,}'}"
-
-
-# ============================================================
-# SNOWFLAKE CONFIG + AUTH (KEYPAIR FIRST)
-# ============================================================
-@dataclass
-class SnowflakeCfg:
-    account: str
-    user: str
-    role: str = ""
-    warehouse: str = ""
-    database: str = ""
-    schema: str = ""
-
-    # Auth options:
-    password: str = ""  # Avoid for Streamlit Cloud if MFA is on
-    private_key_pem: str = ""  # PEM text (-----BEGIN PRIVATE KEY-----)
-    private_key_b64: str = ""  # base64 of PEM text
-    private_key_passphrase: str = ""  # optional passphrase if key is encrypted
-
-
-def _read_snowflake_cfg() -> SnowflakeCfg:
-    try:
-        cfg = st.secrets["snowflake"]
-    except Exception as e:
-        raise RuntimeError(
-            "Missing [snowflake] config in Streamlit secrets. Add it under App → Settings → Secrets."
-        ) from e
-
-    def s(k: str) -> str:
-        v = cfg.get(k, "")
-        return "" if v is None else str(v)
-
-    return SnowflakeCfg(
-        account=s("account"),
-        user=s("user"),
-        role=s("role"),
-        warehouse=s("warehouse"),
-        database=s("database"),
-        schema=s("schema"),
-        password=s("password"),
-        private_key_pem=s("private_key_pem"),
-        private_key_b64=s("private_key_b64"),
-        private_key_passphrase=s("private_key_passphrase"),
-    )
-
-
-def _load_private_key_bytes(cfg: SnowflakeCfg) -> Optional[bytes]:
-    """
-    Returns PEM bytes for the private key if provided.
-    Supports:
-      - cfg.private_key_pem (raw PEM text)
-      - cfg.private_key_b64 (base64 of PEM text)
-    """
-    if cfg.private_key_pem.strip():
-        return cfg.private_key_pem.strip().encode("utf-8")
-
-    if cfg.private_key_b64.strip():
-        try:
-            return base64.b64decode(cfg.private_key_b64.strip())
-        except Exception as e:
-            raise RuntimeError("private_key_b64 is not valid base64.") from e
-
-    return None
-
-
-def _connect_snowflake_keypair(cfg: SnowflakeCfg):
-    """
-    Keypair auth: avoids MFA. This is what you want for Streamlit Cloud.
-    Requires snowflake-connector-python + cryptography.
-    """
-    import snowflake.connector
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-    pem_bytes = _load_private_key_bytes(cfg)
-    if not pem_bytes:
-        raise RuntimeError(
-            "Snowflake keypair auth selected but no private key found. "
-            "Set snowflake.private_key_pem OR snowflake.private_key_b64 in Streamlit secrets."
-        )
-
-    passphrase = cfg.private_key_passphrase.strip().encode("utf-8") if cfg.private_key_passphrase.strip() else None
-
-    try:
-        pkey = load_pem_private_key(pem_bytes, password=passphrase)
-        private_key_der = pkey.private_bytes(
-            encoding=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.Encoding.DER,
-            format=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=__import__("cryptography.hazmat.primitives.serialization").hazmat.primitives.serialization.NoEncryption(),
-        )
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load private key. The PEM may be wrong, encrypted without passphrase, or corrupted."
-        ) from e
-
-    return snowflake.connector.connect(
-        account=cfg.account,
-        user=cfg.user,
-        private_key=private_key_der,
-        role=cfg.role or None,
-        warehouse=cfg.warehouse or None,
-        database=cfg.database or None,
-        schema=cfg.schema or None,
-    )
-
-
-def _connect_snowflake_password(cfg: SnowflakeCfg):
-    """
-    Password auth: will fail if the user is enforced to use MFA/TOTP for this interface.
-    Useful locally sometimes; risky for Streamlit Cloud.
-    """
-    import snowflake.connector
-
-    if not cfg.password.strip():
-        raise RuntimeError("Snowflake password auth selected but snowflake.password is empty.")
-
-    return snowflake.connector.connect(
-        account=cfg.account,
-        user=cfg.user,
-        password=cfg.password,
-        role=cfg.role or None,
-        warehouse=cfg.warehouse or None,
-        database=cfg.database or None,
-        schema=cfg.schema or None,
-    )
-
-
-def _connect_snowflake(cfg: SnowflakeCfg):
-    """
-    Prefer keypair if present; fall back to password if not.
-    """
-    if _load_private_key_bytes(cfg):
-        return _connect_snowflake_keypair(cfg)
-    return _connect_snowflake_password(cfg)
+    return f"{direction} {abs(pct)*100:,.1f}% to {fmt_money(new) if is_money else f'{int(new):,}'}"
 
 
 # ============================================================
@@ -281,7 +131,7 @@ def _coerce_csv_schema(df: pd.DataFrame) -> pd.DataFrame:
     if "ASOF_DATE" in df.columns:
         df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
 
-    # enforce incurred consistency
+    # Enforce incurred consistency if inputs exist
     if "PAID_AMT" in df.columns and "OUTSTANDING_AMT" in df.columns:
         df["INCURRED_AMT"] = (df["PAID_AMT"].fillna(0.0) + df["OUTSTANDING_AMT"].fillna(0.0)).round(2)
 
@@ -293,38 +143,39 @@ def load_data_csv(path: str) -> pd.DataFrame:
     return _coerce_csv_schema(df)
 
 
-def _coerce_snowflake_kpi_schema(df: pd.DataFrame) -> pd.DataFrame:
-    # Normalize to app fields
-    rename_map = {
-        "REPORTED_DATE": "ASOF_DATE",
-        "TOTAL_CLAIMS": "TOTAL_CT",
-        "OPEN_CLAIMS": "OPEN_CT",
-        "CLOSED_CLAIMS": "CLOSED_CT",
-        "PAID": "PAID_AMT",
-        "OUTSTANDING": "OUTSTANDING_AMT",
-        "INCURRED": "INCURRED_AMT",
-    }
-    for src, tgt in rename_map.items():
-        if src in df.columns:
-            df = df.rename(columns={src: tgt})
+def load_data_snowflake_keypair() -> pd.DataFrame:
+    """
+    Key-pair auth (NO MFA prompts).
+    Requires secrets:
+      st.secrets["snowflake"]["private_key_pem"]  (PEM private key)
+      optional st.secrets["snowflake"]["private_key_passphrase"]
+    """
+    import snowflake.connector
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-    if "ASOF_DATE" in df.columns:
-        df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
+    cfg = st.secrets["snowflake"]
 
-    for col in ["TOTAL_CT", "OPEN_CT", "CLOSED_CT"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    private_key_pem = str(cfg.get("private_key_pem", "")).strip()
+    if not private_key_pem:
+        raise RuntimeError("Missing snowflake.private_key_pem in Streamlit secrets.")
 
-    for col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    passphrase = str(cfg.get("private_key_passphrase", "") or "")
+    passphrase_bytes = passphrase.encode("utf-8") if passphrase else None
 
-    return df
+    pkey = load_pem_private_key(
+        private_key_pem.encode("utf-8"),
+        password=passphrase_bytes,
+    )
 
-
-def load_data_snowflake() -> pd.DataFrame:
-    cfg = _read_snowflake_cfg()
-    conn = _connect_snowflake(cfg)
+    conn = snowflake.connector.connect(
+        account=str(cfg["account"]),
+        user=str(cfg["user"]),
+        private_key=pkey,
+        role=str(cfg.get("role", "")),
+        warehouse=str(cfg.get("warehouse", "")),
+        database=str(cfg.get("database", "")),
+        schema=str(cfg.get("schema", "")),
+    )
 
     sql = """
         SELECT
@@ -343,25 +194,43 @@ def load_data_snowflake() -> pd.DataFrame:
     try:
         df = pd.read_sql(sql, conn)
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
 
-    return _coerce_snowflake_kpi_schema(df)
+    # Normalize to app fields
+    df = df.rename(
+        columns={
+            "REPORTED_DATE": "ASOF_DATE",
+            "TOTAL_CLAIMS": "TOTAL_CT",
+            "OPEN_CLAIMS": "OPEN_CT",
+            "CLOSED_CLAIMS": "CLOSED_CT",
+            "PAID": "PAID_AMT",
+            "OUTSTANDING": "OUTSTANDING_AMT",
+            "INCURRED": "INCURRED_AMT",
+        }
+    )
+
+    df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
+    for col in ["TOTAL_CT", "OPEN_CT", "CLOSED_CT"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    for col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    return df
 
 
 @st.cache_data(show_spinner=False, ttl=900)
 def load_data(source: str, csv_path: str) -> pd.DataFrame:
     if source == "snowflake":
-        return load_data_snowflake()
+        return load_data_snowflake_keypair()
     return load_data_csv(csv_path)
 
 
 # ============================================================
 # METRIC COMPUTATION
 # ============================================================
-def latest_and_prior_by_asof(df_scoped: pd.DataFrame):
+def latest_and_prior_by_asof(df_scoped: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[date], Optional[date]]:
     if df_scoped is None or len(df_scoped) == 0 or "ASOF_DATE" not in df_scoped.columns:
         return df_scoped, None, None, None
 
@@ -391,6 +260,7 @@ def snapshot_metrics(df_in: pd.DataFrame, source: str) -> Dict[str, Any]:
         }
 
     if source == "snowflake":
+        # One row per ASOF_DATE
         row = df_in.iloc[0]
         open_ct = int(row.get("OPEN_CT", 0))
         total_ct = int(row.get("TOTAL_CT", 0))
@@ -448,47 +318,25 @@ def build_incurred_stratification(df_in: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# LOAD DATA (WITH SAFETY + VERY LOUD FAILURES)
+# LOAD DATA (WITH SAFETY CHECKS)
 # ============================================================
-if SOURCE not in ("csv", "snowflake"):
-    st.error(f"Invalid DATA_SOURCE={SOURCE!r}. Use 'csv' or 'snowflake'.")
-    st.stop()
-
-if SOURCE == "csv":
+if SOURCE != "snowflake":
     if not os.path.exists(DATA_PATH):
         st.error(f"Could not find {DATA_PATH}. Put the CSV next to app.py (or set DEMO_DATA_PATH).")
         st.stop()
 
 try:
     df = load_data(SOURCE, DATA_PATH)
-except ModuleNotFoundError as e:
-    # This is the classic Streamlit Cloud "you forgot requirements.txt" failure.
-    st.error(
-        "Missing Python package in Streamlit environment.\n\n"
-        f"Details: `{e}`\n\n"
-        "Fix: add required packages to `requirements.txt` (see notes below)."
-    )
-    st.stop()
 except Exception as e:
-    st.error(
-        "Data load failed.\n\n"
-        f"Source: `{SOURCE}`\n"
-        f"Error: `{type(e).__name__}: {e}`\n\n"
-        "If SOURCE is snowflake, this is almost always one of:\n"
-        "- using password auth while MFA/TOTP is enforced\n"
-        "- missing private key in secrets\n"
-        "- wrong account/user/role/warehouse\n"
-        "- network policy restriction\n"
-    )
+    st.error("Data load failed.")
+    st.exception(e)
     st.stop()
 
 # Always show the active source so you can't accidentally misrepresent it
 st.sidebar.markdown(f"**Data source:** `{SOURCE.upper()}`")
 
-
-with st.sidebar.expander("Debug (useful until this stops hurting)"):
+with st.sidebar.expander("Debug (use this to prove it’s Snowflake)", expanded=False):
     st.write("Rows:", len(df))
-    st.write("Columns:", list(df.columns))
     if "ASOF_DATE" in df.columns and len(df):
         st.write("Min ASOF_DATE:", df["ASOF_DATE"].min())
         st.write("Max ASOF_DATE:", df["ASOF_DATE"].max())
@@ -496,9 +344,11 @@ with st.sidebar.expander("Debug (useful until this stops hurting)"):
 
 
 # ============================================================
-# HEADER (LOGO + TITLE)
+# HEADER
 # ============================================================
+LOGO_PATH = os.getenv("NARS_LOGO_PATH", "narslogo.jpg")
 header_left, header_right = st.columns([1, 5], vertical_alignment="center")
+
 with header_left:
     if LOGO_PATH and os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, width=220)
@@ -529,39 +379,26 @@ if SOURCE == "csv":
     with filter_col:
         st.markdown('<div class="sticky-filter">', unsafe_allow_html=True)
         st.markdown("### Filters")
-
         sel_state = st.selectbox("State", states, index=0)
         sel_year = st.selectbox("Accident Year", years, index=0)
         sel_adjuster = st.selectbox("Adjuster", adjusters, index=0)
         sel_cov = st.selectbox("Coverage Type", coverages, index=0)
-
-        st.markdown(
-            '<div class="small-muted">Filters apply to the dashboard (CSV mode only).</div>',
-            unsafe_allow_html=True,
-        )
-
-        if st.button("Reset filters", use_container_width=True):
-            st.rerun()
-
+        st.markdown('<div class="small-muted">Filters apply to the dashboard.</div>', unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Apply filters
     filter_parts = []
     if sel_state != "All" and "LOSS_STATE" in f.columns:
-        filter_parts.append(f"State={sel_state}")
         f = f[f["LOSS_STATE"] == sel_state]
-
+        filter_parts.append(f"State={sel_state}")
     if sel_year != "All" and "ACCIDENT_YEAR" in f.columns:
-        filter_parts.append(f"AccidentYear={sel_year}")
         f = f[f["ACCIDENT_YEAR"] == int(sel_year)]
-
+        filter_parts.append(f"AccidentYear={sel_year}")
     if sel_adjuster != "All" and "ADJUSTER_ID" in f.columns:
-        filter_parts.append(f"Adjuster={sel_adjuster}")
         f = f[f["ADJUSTER_ID"] == sel_adjuster]
-
+        filter_parts.append(f"Adjuster={sel_adjuster}")
     if sel_cov != "All" and "COVERAGE_CODE" in f.columns:
-        filter_parts.append(f"CoverageType={sel_cov}")
         f = f[f["COVERAGE_CODE"] == sel_cov]
+        filter_parts.append(f"CoverageType={sel_cov}")
 
     filter_summary = ", ".join(filter_parts) if filter_parts else "None (All data)"
 else:
@@ -596,7 +433,6 @@ prior = snapshot_metrics(f_prior, source=SOURCE) if f_prior is not None and len(
 with main_col:
     st.caption(f"As-of: {asof if asof else 'N/A'}")
 
-    # KPI row
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Open Claims" if SOURCE == "snowflake" else "Open Features", f"{open_ct:,}")
     k2.metric("Total Incurred", fmt_money_short(incurred))
@@ -604,9 +440,7 @@ with main_col:
     k4.metric("Outstanding", fmt_money_short(outstanding))
     k5.metric("High Severity Features" if SOURCE == "csv" else "High Severity", f"{high_sev_ct:,}")
 
-    st.caption(
-        f"Full totals: Total Incurred {fmt_money(incurred)} | Paid {fmt_money(paid)} | Outstanding {fmt_money(outstanding)}"
-    )
+    st.caption(f"Full totals: Total Incurred {fmt_money(incurred)} | Paid {fmt_money(paid)} | Outstanding {fmt_money(outstanding)}")
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Today’s Headlines")
@@ -631,40 +465,28 @@ with main_col:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Visuals (only meaningful in CSV feature-level mode)
     if SOURCE == "csv":
         tab_open, tab_incurred, tab_sev = st.tabs(["Open Features", "Total Incurred", "Severity Stratification"])
 
         with tab_open:
             if "ACCIDENT_YEAR" in f_latest.columns:
-                by_year = (
-                    f_latest.groupby("ACCIDENT_YEAR", dropna=True)
-                    .size()
-                    .reset_index(name="Feature Count")
-                    .sort_values("ACCIDENT_YEAR")
-                )
+                by_year = f_latest.groupby("ACCIDENT_YEAR", dropna=True).size().reset_index(name="Feature Count").sort_values("ACCIDENT_YEAR")
                 st.bar_chart(by_year.set_index("ACCIDENT_YEAR")["Feature Count"])
             else:
-                st.info("ACCIDENT_YEAR not available in this dataset for the Open Features trend.")
+                st.info("ACCIDENT_YEAR not available in this dataset.")
 
         with tab_incurred:
             if "ACCIDENT_YEAR" in f_latest.columns and "INCURRED_AMT" in f_latest.columns:
-                inc_by_year = (
-                    f_latest.groupby("ACCIDENT_YEAR", dropna=True)["INCURRED_AMT"]
-                    .sum()
-                    .reset_index()
-                    .sort_values("ACCIDENT_YEAR")
-                )
+                inc_by_year = f_latest.groupby("ACCIDENT_YEAR", dropna=True)["INCURRED_AMT"].sum().reset_index().sort_values("ACCIDENT_YEAR")
                 st.bar_chart(inc_by_year.set_index("ACCIDENT_YEAR")["INCURRED_AMT"])
-                st.caption("Chart shows Total Incurred summed by Accident Year (feature-level).")
             else:
-                st.info("ACCIDENT_YEAR / INCURRED_AMT not available for Total Incurred trend.")
+                st.info("ACCIDENT_YEAR / INCURRED_AMT not available in this dataset.")
 
         with tab_sev:
             sev_tbl = build_incurred_stratification(f_latest)
             if len(sev_tbl):
                 st.dataframe(sev_tbl, use_container_width=True, hide_index=True)
             else:
-                st.info("No incurred data available for severity stratification in the current filter set.")
+                st.info("No incurred data available for stratification.")
     else:
-        st.info("Snowflake KPI mode: visual breakdowns are hidden (you’re using a daily KPI view).")
+        st.info("Snowflake KPI mode: detail visuals are hidden (daily KPI view).")
