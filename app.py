@@ -430,7 +430,7 @@ with main_col:
         render_answer(answer_ask_nars("state w/ highest incurred"))
 
     with st.form("ask_nars_form", clear_on_submit=False):
-        q = st.text_input("Ask a question", placeholder="e.g., top 10 severe, total incurred, open features")
+        q = st.text_input("Ask NARS", placeholder="e.g., top 10 severe, total incurred, open features")
         submitted = st.form_submit_button("Ask")
 
     if submitted:
@@ -599,39 +599,68 @@ with main_col:
 
     st.divider()
 
-    # Email demo
+    # =========================
+# Email demo (SAFE / OPTIONAL)
+# =========================
+
+SHOW_EMAIL_DEMO = False  # <<< keep False for tomorrow's Accredited demo
+
+if SHOW_EMAIL_DEMO:
     st.subheader("Daily Email Demo")
     st.caption("Sends a summary email via Outlook (demo). Preview below shows exactly what is sent.")
 
-    to_email = st.text_input("Send to", value=os.getenv("DEMO_EMAIL_TO", ""))
-    dashboard_link = st.text_input("Dashboard link", value=os.getenv("DEMO_DASHBOARD_LINK", "http://localhost:8501"))
+    # Defensive defaults (avoid NameError if upstream variables aren't set)
+    _client = str(locals().get("client") or "Client")
+    _asof = locals().get("asof") or "N/A"
 
+    _filter_summary = str(locals().get("filter_summary") or "None")
+    _total_ct = int(locals().get("total_ct") or 0)
+
+    _open_ct = int(locals().get("open_ct") or 0)
+    _high_sev_ct = int(locals().get("high_sev_ct") or 0)
+
+    _incurred = float(locals().get("incurred") or 0.0)
+    _paid = float(locals().get("paid") or 0.0)
+    _outstanding = float(locals().get("outstanding") or 0.0)
+
+    _open_vs_last = str(locals().get("open_vs_last") or "N/A")
+    _inc_vs_last = str(locals().get("inc_vs_last") or "N/A")
+    _hs_vs_last = str(locals().get("hs_vs_last") or "N/A")
+
+    # Inputs
+    to_email = st.text_input("Send to", value=os.getenv("DEMO_EMAIL_TO", ""))
+    dashboard_link = st.text_input(
+        "Dashboard link",
+        value=os.getenv("DEMO_DASHBOARD_LINK", "https://nars-demo.streamlit.app"),
+    )
+
+    # Build HTML (f-string is intentional)
     summary_html = f"""
     <div style="font-family: Arial, sans-serif; line-height: 1.4;">
-      <h2 style="margin:0 0 8px 0;">{client} Daily Claims Snapshot</h2>
+      <h2 style="margin:0 0 8px 0;">{_client} Daily Claims Snapshot</h2>
 
       <div style="color:#555; margin-bottom:10px;">
-        As-of: {asof if asof else "N/A"} (representative demo dataset; feature-level)
+        As-of: {_asof} (representative demo dataset; feature-level)
       </div>
 
       <div style="padding:10px 12px; background:#f6f7f9; border-radius:8px; margin-bottom:12px;">
         <div style="font-size:14px; margin-bottom:6px;"><b>Today’s headlines</b></div>
-        <div style="margin:4px 0;">• Open Features {open_vs_last} (since last email)</div>
-        <div style="margin:4px 0;">• Total Incurred {inc_vs_last} (since last email)</div>
-        <div style="margin:4px 0;">• High Severity Features {hs_vs_last} (since last email)</div>
+        <div style="margin:4px 0;">• Open Features {_open_vs_last} (since last email)</div>
+        <div style="margin:4px 0;">• Total Incurred {_inc_vs_last} (since last email)</div>
+        <div style="margin:4px 0;">• High Severity Features {_hs_vs_last} (since last email)</div>
       </div>
 
       <div style="font-size:12px; color:#666; margin-bottom:12px;">
-        <b>Filters applied:</b> {filter_summary}<br/>
-        <b>Features included (latest as-of):</b> {total_ct:,}
+        <b>Filters applied:</b> {_filter_summary}<br/>
+        <b>Features included (latest as-of):</b> {_total_ct:,}
       </div>
 
       <ul>
-        <li><b>Open Features:</b> {open_ct:,}</li>
-        <li><b>Total Incurred:</b> {fmt_money(incurred)}</li>
-        <li><b>Paid:</b> {fmt_money(paid)}</li>
-        <li><b>Outstanding:</b> {fmt_money(outstanding)}</li>
-        <li><b>High Severity Features:</b> {high_sev_ct:,}</li>
+        <li><b>Open Features:</b> {_open_ct:,}</li>
+        <li><b>Total Incurred:</b> {fmt_money(_incurred)}</li>
+        <li><b>Paid:</b> {fmt_money(_paid)}</li>
+        <li><b>Outstanding:</b> {fmt_money(_outstanding)}</li>
+        <li><b>High Severity Features:</b> {_high_sev_ct:,}</li>
       </ul>
 
       <p style="margin-top:12px;">
@@ -649,26 +678,35 @@ with main_col:
     with st.expander("Preview email HTML"):
         st.markdown(summary_html, unsafe_allow_html=True)
 
-    if st.button("Send me the demo email", type="primary"):
+    # Only allow sending if the function exists (prevents missing-module crashes)
+    _send_fn = locals().get("send_demo_email_outlook", None)
+    can_send = callable(_send_fn)
+
+    if not can_send:
+        st.info("Email sending is disabled in this environment (demo UI only).")
+
+    if st.button("Send me the demo email", type="primary", disabled=not can_send):
         if not to_email.strip():
             st.error("Enter an email address in 'Send to'.")
         else:
             st.session_state["last_sent_metrics"] = {
                 "sent_at": datetime.now().isoformat(timespec="seconds"),
-                "filter_summary": filter_summary,
-                "open_ct": open_ct,
-                "incurred": incurred,
-                "paid": paid,
-                "outstanding": outstanding,
-                "high_sev_ct": high_sev_ct,
+                "filter_summary": _filter_summary,
+                "open_ct": _open_ct,
+                "incurred": _incurred,
+                "paid": _paid,
+                "outstanding": _outstanding,
+                "high_sev_ct": _high_sev_ct,
             }
 
-            ok, msg = send_demo_email_outlook(
+            subject = f"{_client} Daily Claims Snapshot (Demo)"
+            ok, msg = _send_fn(
                 to_email=to_email.strip(),
-                subject=f"{client} Daily Claims Snapshot (Demo)",
+                subject=subject,
                 html_body=summary_html,
             )
             if ok:
                 st.success("Email sent. Change a filter and send again to prove it’s computed from data.")
             else:
                 st.error(msg)
+
