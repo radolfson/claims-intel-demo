@@ -90,31 +90,98 @@ hr {{
 # ============================================================
 DATA_PATH = os.getenv("DEMO_DATA_PATH", "demo_features_latest.csv")
 
+def _get_data_source() -> str:
+    # Streamlit Cloud uses secrets; local can use env var
+    try:
+        return str(st.secrets.get("DATA_SOURCE", os.getenv("DATA_SOURCE", "csv"))).lower().strip()
+    except Exception:
+        return str(os.getenv("DATA_SOURCE", "csv")).lower().strip()
 
-@st.cache_data(show_spinner=False)
+
+@st.cache_data(show_spinner=False, ttl=900)
 def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    """
+    Returns a dataframe in the app's expected schema.
+    Supports:
+      - CSV (demo_features_latest.csv)
+      - Snowflake (PROCESSED contract view)
+    """
+    source = _get_data_source()
 
-    # Best-effort typing
-    if "ACCIDENT_YEAR" in df.columns:
-        df["ACCIDENT_YEAR"] = pd.to_numeric(df["ACCIDENT_YEAR"], errors="coerce").fillna(0).astype(int)
+    if source == "snowflake":
+        df = _load_data_from_snowflake()
+    else:
+        df = pd.read_csv(path)
 
-    for flag_col in ["OPEN_FLAG", "HIGH_SEVERITY_FLAG"]:
-        if flag_col in df.columns:
-            df[flag_col] = pd.to_numeric(df[flag_col], errors="coerce").fillna(0).astype(int)
+    df = _coerce_app_schema(df)
+    return df
 
-    for money_col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
-        if money_col in df.columns:
-            df[money_col] = pd.to_numeric(df[money_col], errors="coerce").fillna(0.0)
 
+def _load_data_from_snowflake() -> pd.DataFrame:
+    """
+    Snowflake loader for Streamlit Community Cloud.
+    Expects Streamlit secrets:
+      [snowflake] account/user/password/role/warehouse/database/schema
+    """
+    import snowflake.connector
+
+    cfg = st.secrets["snowflake"]
+
+    conn = snowflake.connector.connect(
+        account=str(cfg["account"]),
+        user=str(cfg["user"]),
+        password=str(cfg["password"]),
+        role=str(cfg.get("role", "")),
+        warehouse=str(cfg.get("warehouse", "")),
+        database=str(cfg.get("database", "")),
+        schema=str(cfg.get("schema", "")),
+    )
+
+    # Use the contract view if possible.
+    # If you need a transportation-specific view/table, swap it here.
+    sql = """
+        SELECT *
+        FROM NARS.PROCESSED.V_FEATURE_DAILY_STATUS
+    """
+
+    try:
+        df = pd.read_sql(sql, conn)
+    finally:
+        conn.close()
+
+    return df
+
+
+def _coerce_app_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize Snowflake column names to what the app expects.
+    """
+
+    rename_map = {
+        "REPORTED_DATE": "ASOF_DATE",
+        "OPEN_CLAIMS": "OPEN_CT",
+        "TOTAL_CLAIMS": "TOTAL_CT",
+        "CLOSED_CLAIMS": "CLOSED_CT",
+        "PAID": "PAID_AMT",
+        "OUTSTANDING": "OUTSTANDING_AMT",
+        "INCURRED": "INCURRED_AMT",
+    }
+
+    for src, tgt in rename_map.items():
+        if src in df.columns:
+            df = df.rename(columns={src: tgt})
+
+    # Convert date properly
     if "ASOF_DATE" in df.columns:
         df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
 
-    # Enforce incurred consistency if inputs exist
-    if "PAID_AMT" in df.columns and "OUTSTANDING_AMT" in df.columns:
-        df["INCURRED_AMT"] = (df["PAID_AMT"].fillna(0.0) + df["OUTSTANDING_AMT"].fillna(0.0)).round(2)
+    # Ensure money columns are numeric
+    for col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     return df
+
 
 
 def fmt_money(x: float) -> str:
@@ -131,100 +198,6 @@ def fmt_money_short(x: float) -> str:
     if ax >= 1_000:
         return f"${x/1_000:,.1f}K"
     return f"${x:,.0f}"
-
-
-def pct_change(new: float, old: float) -> float | None:
-    if old is None or old == 0:
-        return None
-    return (new - old) / old
-
-
-def fmt_delta(new: float, old: float, is_money: bool = False) -> str:
-    """Format change as 'up/down X% to Y' with guardrails."""
-    if old is None:
-        return "no prior comparison available"
-    if old == 0 and new == 0:
-        return "flat at 0"
-    if old == 0 and new != 0:
-        return f"new activity to {fmt_money(new) if is_money else f'{int(new):,}'}"
-
-    p = pct_change(new, old)
-    direction = "up" if new > old else "down" if new < old else "flat"
-    if p is None:
-        return f"{direction} to {fmt_money(new) if is_money else f'{int(new):,}'}"
-    return f"{direction} {abs(p)*100:,.1f}% to {fmt_money(new) if is_money else f'{int(new):,}'}"
-
-
-def build_incurred_stratification(df_in: pd.DataFrame) -> pd.DataFrame:
-    """Return a clean, labeled incurred stratification table."""
-    if "INCURRED_AMT" not in df_in.columns or len(df_in) == 0:
-        return pd.DataFrame(columns=["Incurred Range", "Feature Count"])
-
-    bin_edges = [0, 10_000, 25_000, 50_000, 100_000, 250_000, 1_000_000, float("inf")]
-    labels = ["$0–$10K", "$10K–$25K", "$25K–$50K", "$50K–$100K", "$100K–$250K", "$250K–$1M", "$1M+"]
-
-    cut = pd.cut(
-        df_in["INCURRED_AMT"],
-        bins=bin_edges,
-        labels=labels,
-        include_lowest=True,
-        right=True,
-    )
-
-    sev = (
-        cut.value_counts(dropna=False)
-        .reindex(labels, fill_value=0)
-        .reset_index()
-    )
-    sev.columns = ["Incurred Range", "Feature Count"]
-    return sev
-
-
-def snapshot_metrics(df_in: pd.DataFrame) -> dict:
-    """Compute metrics from a dataframe already scoped to a single ASOF_DATE."""
-    open_ct = int(df_in["OPEN_FLAG"].sum()) if "OPEN_FLAG" in df_in.columns else 0
-    total_ct = int(len(df_in))
-    closed_ct = total_ct - open_ct
-
-    incurred = float(df_in["INCURRED_AMT"].sum()) if "INCURRED_AMT" in df_in.columns else 0.0
-    paid = float(df_in["PAID_AMT"].sum()) if "PAID_AMT" in df_in.columns else 0.0
-    outstanding = float(df_in["OUTSTANDING_AMT"].sum()) if "OUTSTANDING_AMT" in df_in.columns else 0.0
-    high_sev_ct = int(df_in["HIGH_SEVERITY_FLAG"].sum()) if "HIGH_SEVERITY_FLAG" in df_in.columns else 0
-
-    sev_share = (high_sev_ct / open_ct) if open_ct else 0.0
-
-    return {
-        "open_ct": open_ct,
-        "total_ct": total_ct,
-        "closed_ct": closed_ct,
-        "incurred": incurred,
-        "paid": paid,
-        "outstanding": outstanding,
-        "high_sev_ct": high_sev_ct,
-        "sev_share": sev_share,
-    }
-
-
-def latest_and_prior_by_asof(
-    df_scoped: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame | None, object | None, object | None]:
-    """
-    Returns (latest_df, prior_df_or_none, latest_date, prior_date).
-    Expects ASOF_DATE exists and is already a date type.
-    """
-    if "ASOF_DATE" not in df_scoped.columns or len(df_scoped) == 0:
-        return df_scoped, None, None, None
-
-    dates = sorted([d for d in df_scoped["ASOF_DATE"].dropna().unique().tolist() if d is not None])
-    if not dates:
-        return df_scoped, None, None, None
-
-    latest = dates[-1]
-    prior = dates[-2] if len(dates) >= 2 else None
-
-    latest_df = df_scoped[df_scoped["ASOF_DATE"] == latest].copy()
-    prior_df = df_scoped[df_scoped["ASOF_DATE"] == prior].copy() if prior else None
-    return latest_df, prior_df, latest, prior
 
 
 # ============================================================
