@@ -1,5 +1,6 @@
 streamlit
 pandas
 numpy
-snowflake-connector-python[pandas]
+snowflake-connector-python
 cryptography
+pyarrow
