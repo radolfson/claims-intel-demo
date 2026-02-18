@@ -86,9 +86,10 @@ hr {{
 )
 
 # ============================================================
-# DATA LOAD + HELPERS
+# DATA LOAD + HELPERS (CSV row-level OR Snowflake KPI-level)
 # ============================================================
 DATA_PATH = os.getenv("DEMO_DATA_PATH", "demo_features_latest.csv")
+
 
 def _get_data_source() -> str:
     # Streamlit Cloud uses secrets; local can use env var
@@ -101,10 +102,9 @@ def _get_data_source() -> str:
 @st.cache_data(show_spinner=False, ttl=900)
 def load_data(path: str) -> pd.DataFrame:
     """
-    Returns a dataframe in the app's expected schema.
-    Supports:
-      - CSV (demo_features_latest.csv)
-      - Snowflake (PROCESSED contract view)
+    Returns a dataframe normalized for the app.
+    - CSV mode: row-level "features" dataset (your demo CSV)
+    - Snowflake mode: KPI-per-day transportation dataset (V_TRANSPORTATION_DAILY)
     """
     source = _get_data_source()
 
@@ -113,20 +113,14 @@ def load_data(path: str) -> pd.DataFrame:
     else:
         df = pd.read_csv(path)
 
-    df = _coerce_app_schema(df)
+    df = _coerce_app_schema(df, source=source)
     return df
 
 
 def _load_data_from_snowflake() -> pd.DataFrame:
-    """
-    Snowflake loader for Streamlit Community Cloud.
-    Expects Streamlit secrets:
-      [snowflake] account/user/password/role/warehouse/database/schema
-    """
     import snowflake.connector
 
     cfg = st.secrets["snowflake"]
-
     conn = snowflake.connector.connect(
         account=str(cfg["account"]),
         user=str(cfg["user"]),
@@ -137,11 +131,11 @@ def _load_data_from_snowflake() -> pd.DataFrame:
         schema=str(cfg.get("schema", "")),
     )
 
-    # Use the contract view if possible.
-    # If you need a transportation-specific view/table, swap it here.
+    # Transportation KPI daily view you validated
     sql = """
         SELECT *
-        FROM NARS.PROCESSED.V_FEATURE_DAILY_STATUS
+        FROM NARS.PROCESSED.V_TRANSPORTATION_DAILY
+        ORDER BY REPORTED_DATE
     """
 
     try:
@@ -152,140 +146,201 @@ def _load_data_from_snowflake() -> pd.DataFrame:
     return df
 
 
-def _coerce_app_schema(df: pd.DataFrame) -> pd.DataFrame:
+def _coerce_app_schema(df: pd.DataFrame, source: str) -> pd.DataFrame:
     """
-    Normalize Snowflake column names to what the app expects.
+    Normalize columns for downstream logic.
+    - In snowflake KPI mode, we map the KPI columns to *_AMT fields and *_CT fields.
+    - In CSV mode, keep your original coercions and incurred enforcement.
     """
 
-    rename_map = {
-        "REPORTED_DATE": "ASOF_DATE",
-        "OPEN_CLAIMS": "OPEN_CT",
-        "TOTAL_CLAIMS": "TOTAL_CT",
-        "CLOSED_CLAIMS": "CLOSED_CT",
-        "PAID": "PAID_AMT",
-        "OUTSTANDING": "OUTSTANDING_AMT",
-        "INCURRED": "INCURRED_AMT",
-    }
+    if source == "snowflake":
+        # Snowflake KPI view columns -> app-friendly names
+        rename_map = {
+            "REPORTED_DATE": "ASOF_DATE",
+            "OPEN_CLAIMS": "OPEN_CT",
+            "TOTAL_CLAIMS": "TOTAL_CT",
+            "CLOSED_CLAIMS": "CLOSED_CT",
+            "PAID": "PAID_AMT",
+            "OUTSTANDING": "OUTSTANDING_AMT",
+            "INCURRED": "INCURRED_AMT",
+        }
+        for src, tgt in rename_map.items():
+            if src in df.columns:
+                df = df.rename(columns={src: tgt})
 
-    for src, tgt in rename_map.items():
-        if src in df.columns:
-            df = df.rename(columns={src: tgt})
+        if "ASOF_DATE" in df.columns:
+            df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
 
-    # Convert date properly
+        for col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+        for col in ["OPEN_CT", "TOTAL_CT", "CLOSED_CT"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+        return df
+
+    # ---- CSV MODE (your original coercions) ----
+    if "ACCIDENT_YEAR" in df.columns:
+        df["ACCIDENT_YEAR"] = pd.to_numeric(df["ACCIDENT_YEAR"], errors="coerce").fillna(0).astype(int)
+
+    for flag_col in ["OPEN_FLAG", "HIGH_SEVERITY_FLAG"]:
+        if flag_col in df.columns:
+            df[flag_col] = pd.to_numeric(df[flag_col], errors="coerce").fillna(0).astype(int)
+
+    for money_col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
+        if money_col in df.columns:
+            df[money_col] = pd.to_numeric(df[money_col], errors="coerce").fillna(0.0)
+
     if "ASOF_DATE" in df.columns:
         df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
 
-    # Ensure money columns are numeric
-    for col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    # Enforce incurred consistency if inputs exist
+    if "PAID_AMT" in df.columns and "OUTSTANDING_AMT" in df.columns:
+        df["INCURRED_AMT"] = (df["PAID_AMT"].fillna(0.0) + df["OUTSTANDING_AMT"].fillna(0.0)).round(2)
 
     return df
 
 
+def latest_and_prior_by_asof(df_scoped: pd.DataFrame):
+    """
+    Works for both:
+    - CSV row-level (many rows per ASOF_DATE)
+    - Snowflake KPI-level (one row per ASOF_DATE)
+    """
+    if df_scoped is None or len(df_scoped) == 0 or "ASOF_DATE" not in df_scoped.columns:
+        return df_scoped, None, None, None
 
-def fmt_money(x: float) -> str:
-    return f"${float(x):,.0f}"
+    dates = sorted([d for d in df_scoped["ASOF_DATE"].dropna().unique().tolist() if d is not None])
+    if not dates:
+        return df_scoped, None, None, None
+
+    latest = dates[-1]
+    prior = dates[-2] if len(dates) >= 2 else None
+
+    latest_df = df_scoped[df_scoped["ASOF_DATE"] == latest].copy()
+    prior_df = df_scoped[df_scoped["ASOF_DATE"] == prior].copy() if prior else None
+    return latest_df, prior_df, latest, prior
 
 
-def fmt_money_short(x: float) -> str:
-    x = float(x)
-    ax = abs(x)
-    if ax >= 1_000_000_000:
-        return f"${x/1_000_000_000:,.1f}B"
-    if ax >= 1_000_000:
-        return f"${x/1_000_000:,.1f}M"
-    if ax >= 1_000:
-        return f"${x/1_000:,.1f}K"
-    return f"${x:,.0f}"
+def snapshot_metrics(df_in: pd.DataFrame, source: str) -> dict:
+    """
+    CSV mode: sums flags/amounts across rows.
+    Snowflake mode: reads the single KPI row for that date.
+    """
+    if df_in is None or len(df_in) == 0:
+        return {
+            "open_ct": 0,
+            "total_ct": 0,
+            "closed_ct": 0,
+            "incurred": 0.0,
+            "paid": 0.0,
+            "outstanding": 0.0,
+            "high_sev_ct": 0,
+            "sev_share": 0.0,
+        }
+
+    if source == "snowflake":
+        row = df_in.iloc[0]
+        open_ct = int(row.get("OPEN_CT", 0))
+        total_ct = int(row.get("TOTAL_CT", 0))
+        closed_ct = int(row.get("CLOSED_CT", 0))
+        incurred = float(row.get("INCURRED_AMT", 0.0))
+        paid = float(row.get("PAID_AMT", 0.0))
+        outstanding = float(row.get("OUTSTANDING_AMT", 0.0))
+
+        return {
+            "open_ct": open_ct,
+            "total_ct": total_ct,
+            "closed_ct": closed_ct,
+            "incurred": incurred,
+            "paid": paid,
+            "outstanding": outstanding,
+            "high_sev_ct": 0,
+            "sev_share": 0.0,
+        }
+
+    # CSV feature-level mode
+    open_ct = int(df_in["OPEN_FLAG"].sum()) if "OPEN_FLAG" in df_in.columns else 0
+    total_ct = int(len(df_in))
+    closed_ct = total_ct - open_ct
+
+    incurred = float(df_in["INCURRED_AMT"].sum()) if "INCURRED_AMT" in df_in.columns else 0.0
+    paid = float(df_in["PAID_AMT"].sum()) if "PAID_AMT" in df_in.columns else 0.0
+    outstanding = float(df_in["OUTSTANDING_AMT"].sum()) if "OUTSTANDING_AMT" in df_in.columns else 0.0
+    high_sev_ct = int(df_in["HIGH_SEVERITY_FLAG"].sum()) if "HIGH_SEVERITY_FLAG" in df_in.columns else 0
+
+    sev_share = (high_sev_ct / open_ct) if open_ct else 0.0
+
+    return {
+        "open_ct": open_ct,
+        "total_ct": total_ct,
+        "closed_ct": closed_ct,
+        "incurred": incurred,
+        "paid": paid,
+        "outstanding": outstanding,
+        "high_sev_ct": high_sev_ct,
+        "sev_share": sev_share,
+    }
 
 
 # ============================================================
 # LOAD DATA
 # ============================================================
-if not os.path.exists(DATA_PATH):
-    st.error(f"Could not find {DATA_PATH}. Put the CSV next to app.py (or set DEMO_DATA_PATH).")
-    st.stop()
+SOURCE = _get_data_source()
+
+if SOURCE != "snowflake":
+    if not os.path.exists(DATA_PATH):
+        st.error(f"Could not find {DATA_PATH}. Put the CSV next to app.py (or set DEMO_DATA_PATH).")
+        st.stop()
 
 df = load_data(DATA_PATH)
 
-states = ["All"] + sorted(df["LOSS_STATE"].dropna().unique().tolist()) if "LOSS_STATE" in df.columns else ["All"]
-years = ["All"] + sorted(df["ACCIDENT_YEAR"].dropna().unique().tolist()) if "ACCIDENT_YEAR" in df.columns else ["All"]
-adjusters = ["All"] + sorted(df["ADJUSTER_ID"].dropna().unique().tolist()) if "ADJUSTER_ID" in df.columns else ["All"]
-coverages = ["All"] + sorted(df["COVERAGE_CODE"].dropna().unique().tolist()) if "COVERAGE_CODE" in df.columns else ["All"]
+# Sidebar badge so you cannot accidentally lie tomorrow
+st.sidebar.caption(f"Data source: **{SOURCE.upper()}**")
 
-# ============================================================
-# HEADER (LOGO + TITLE)
-# ============================================================
-LOGO_PATH = os.getenv("NARS_LOGO_PATH", "narslogo.jpg")
+# In Snowflake KPI mode, these filter fields don't exist (and that's fine)
+states = ["All"] + sorted(df["LOSS_STATE"].dropna().unique().tolist()) if (SOURCE != "snowflake" and "LOSS_STATE" in df.columns) else ["All"]
+years = ["All"] + sorted(df["ACCIDENT_YEAR"].dropna().unique().tolist()) if (SOURCE != "snowflake" and "ACCIDENT_YEAR" in df.columns) else ["All"]
+adjusters = ["All"] + sorted(df["ADJUSTER_ID"].dropna().unique().tolist()) if (SOURCE != "snowflake" and "ADJUSTER_ID" in df.columns) else ["All"]
+coverages = ["All"] + sorted(df["COVERAGE_CODE"].dropna().unique().tolist()) if (SOURCE != "snowflake" and "COVERAGE_CODE" in df.columns) else ["All"]
 
-header_left, header_right = st.columns([1, 5], vertical_alignment="center")
-with header_left:
-    if LOGO_PATH and os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width=220)
-
-with header_right:
-    st.title("Claims Intelligence – Daily Summary (Demo)")
-    st.write(
-        "Representative dataset demonstrating NARS feature-level metric logic "
-        "and the client delivery experience (daily email + dashboard)."
-    )
-
-# ============================================================
-# LAYOUT: MAIN + FILTER PANEL
-# ============================================================
-main_col, filter_col = st.columns([4, 1], gap="large")
-
-with filter_col:
-    st.markdown('<div class="sticky-filter">', unsafe_allow_html=True)
-
-    st.markdown("### Filters")
-
-    
-    sel_state = st.selectbox("State", states, index=0)
-    sel_year = st.selectbox("Accident Year", years, index=0)
-    sel_adjuster = st.selectbox("Adjuster", adjusters, index=0)
-    sel_cov = st.selectbox("Coverage Type", coverages, index=0)
-
-    st.markdown(
-        '<div class="small-muted">Filters apply to both the dashboard and the emailed snapshot.</div>',
-        unsafe_allow_html=True,
-    )
-
-    if st.button("Reset filters", use_container_width=True):
-        st.rerun()
-
-    st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================
 # FILTER LOGIC + KPI COMPUTATIONS
 # ============================================================
-filter_parts = []
-if sel_state != "All":
-    filter_parts.append(f"State={sel_state}")
-if sel_year != "All":
-    filter_parts.append(f"AccidentYear={sel_year}")
-if sel_adjuster != "All":
-    filter_parts.append(f"Adjuster={sel_adjuster}")
-if sel_cov != "All":
-    filter_parts.append(f"CoverageType={sel_cov}")
-filter_summary = ", ".join(filter_parts) if filter_parts else "None (All data)"
-
 # Apply filters to full dataset
 f = df.copy()
-if sel_state != "All" and "LOSS_STATE" in f.columns:
-    f = f[f["LOSS_STATE"] == sel_state]
-if sel_year != "All" and "ACCIDENT_YEAR" in f.columns:
-    f = f[f["ACCIDENT_YEAR"] == int(sel_year)]
-if sel_adjuster != "All" and "ADJUSTER_ID" in f.columns:
-    f = f[f["ADJUSTER_ID"] == sel_adjuster]
-if sel_cov != "All" and "COVERAGE_CODE" in f.columns:
-    f = f[f["COVERAGE_CODE"] == sel_cov]
 
-# Snapshot to latest ASOF_DATE within filter scope (and prior for meaningful headlines)
+# Disable row-level filters in Snowflake KPI mode (they don't exist)
+if SOURCE == "snowflake":
+    filter_summary = "Snowflake KPI mode (row-level filters disabled)"
+else:
+    filter_parts = []
+    if sel_state != "All":
+        filter_parts.append(f"State={sel_state}")
+    if sel_year != "All":
+        filter_parts.append(f"AccidentYear={sel_year}")
+    if sel_adjuster != "All":
+        filter_parts.append(f"Adjuster={sel_adjuster}")
+    if sel_cov != "All":
+        filter_parts.append(f"CoverageType={sel_cov}")
+    filter_summary = ", ".join(filter_parts) if filter_parts else "None (All data)"
+
+    if sel_state != "All" and "LOSS_STATE" in f.columns:
+        f = f[f["LOSS_STATE"] == sel_state]
+    if sel_year != "All" and "ACCIDENT_YEAR" in f.columns:
+        f = f[f["ACCIDENT_YEAR"] == int(sel_year)]
+    if sel_adjuster != "All" and "ADJUSTER_ID" in f.columns:
+        f = f[f["ADJUSTER_ID"] == sel_adjuster]
+    if sel_cov != "All" and "COVERAGE_CODE" in f.columns:
+        f = f[f["COVERAGE_CODE"] == sel_cov]
+
+# Snapshot to latest ASOF_DATE within scope (and prior for meaningful headlines)
 f_latest, f_prior, asof, prior_asof = latest_and_prior_by_asof(f)
 
-cur = snapshot_metrics(f_latest)
+cur = snapshot_metrics(f_latest, source=SOURCE)
 open_ct = cur["open_ct"]
 total_ct = cur["total_ct"]
 closed_ct = cur["closed_ct"]
