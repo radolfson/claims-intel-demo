@@ -143,52 +143,84 @@ def load_data_csv(path: str) -> pd.DataFrame:
     return _coerce_csv_schema(df)
 
 
+def _snowflake_cfg() -> Dict[str, Any]:
+    """
+    Supports:
+      - st.secrets["snowflake"] dict (preferred in Streamlit Community Cloud)
+      - env vars as backup
+    """
+    cfg = {}
+    try:
+        cfg = dict(st.secrets.get("snowflake", {}))
+    except Exception:
+        cfg = {}
+
+    # Backup env vars if not in secrets
+    def _get(k: str, env_k: str) -> str:
+        v = cfg.get(k, "")
+        return str(v) if v not in [None, ""] else str(os.getenv(env_k, ""))
+
+    return {
+        "account": _get("account", "SNOWFLAKE_ACCOUNT"),
+        "user": _get("user", "SNOWFLAKE_USER"),
+        "role": _get("role", "SNOWFLAKE_ROLE"),
+        "warehouse": _get("warehouse", "SNOWFLAKE_WAREHOUSE"),
+        "database": _get("database", "SNOWFLAKE_DATABASE"),
+        "schema": _get("schema", "SNOWFLAKE_SCHEMA"),
+        "private_key_pem": str(cfg.get("private_key_pem", "") or os.getenv("SNOWFLAKE_PRIVATE_KEY_PEM", "")).strip(),
+        "private_key_passphrase": str(cfg.get("private_key_passphrase", "") or os.getenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")).strip(),
+    }
+
+
 def load_data_snowflake_keypair() -> pd.DataFrame:
     """
     Key-pair auth (NO MFA prompts).
-    Requires secrets:
-      st.secrets["snowflake"]["private_key_pem"]  (PEM private key)
-      optional st.secrets["snowflake"]["private_key_passphrase"]
+    Requires secrets or env vars:
+      - snowflake.private_key_pem (PEM private key)
+      - optional snowflake.private_key_passphrase
     """
     import snowflake.connector
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-    cfg = st.secrets["snowflake"]
+    cfg = _snowflake_cfg()
 
-    private_key_pem = str(cfg.get("private_key_pem", "")).strip()
-    if not private_key_pem:
-        raise RuntimeError("Missing snowflake.private_key_pem in Streamlit secrets.")
+    missing = [k for k in ["account", "user", "warehouse", "database", "schema"] if not cfg.get(k)]
+    if missing:
+        raise RuntimeError(f"Missing Snowflake config keys: {', '.join(missing)}")
 
-    passphrase = str(cfg.get("private_key_passphrase", "") or "")
-    passphrase_bytes = passphrase.encode("utf-8") if passphrase else None
+    if not cfg["private_key_pem"]:
+        raise RuntimeError("Missing snowflake.private_key_pem in Streamlit secrets (or SNOWFLAKE_PRIVATE_KEY_PEM env var).")
+
+    passphrase_bytes = cfg["private_key_passphrase"].encode("utf-8") if cfg["private_key_passphrase"] else None
 
     pkey = load_pem_private_key(
-        private_key_pem.encode("utf-8"),
+        cfg["private_key_pem"].encode("utf-8"),
         password=passphrase_bytes,
     )
 
     conn = snowflake.connector.connect(
-        account=str(cfg["account"]),
-        user=str(cfg["user"]),
+        account=cfg["account"],
+        user=cfg["user"],
         private_key=pkey,
-        role=str(cfg.get("role", "")),
-        warehouse=str(cfg.get("warehouse", "")),
-        database=str(cfg.get("database", "")),
-        schema=str(cfg.get("schema", "")),
+        role=cfg.get("role") or None,
+        warehouse=cfg["warehouse"],
+        database=cfg["database"],
+        schema=cfg["schema"],
     )
 
+    # IMPORTANT:
+    # Your Snowflake view uses REPORT_DATE, not REPORTED_DATE.
+    # It also may not have CLOSED_CLAIMS / METRIC_NOTE, so we compute / handle safely.
     sql = """
         SELECT
-            REPORTED_DATE,
+            REPORT_DATE,
             TOTAL_CLAIMS,
             OPEN_CLAIMS,
-            CLOSED_CLAIMS,
             PAID,
             OUTSTANDING,
-            INCURRED,
-            METRIC_NOTE
+            INCURRED
         FROM NARS.PROCESSED.V_TRANSPORTATION_DAILY
-        ORDER BY REPORTED_DATE
+        ORDER BY REPORT_DATE
     """
 
     try:
@@ -197,9 +229,13 @@ def load_data_snowflake_keypair() -> pd.DataFrame:
         conn.close()
 
     # Normalize to app fields
+    # Closed claims isn't present in your view, so compute it.
+    df["CLOSED_CLAIMS"] = (pd.to_numeric(df.get("TOTAL_CLAIMS", 0), errors="coerce").fillna(0)
+                           - pd.to_numeric(df.get("OPEN_CLAIMS", 0), errors="coerce").fillna(0))
+
     df = df.rename(
         columns={
-            "REPORTED_DATE": "ASOF_DATE",
+            "REPORT_DATE": "ASOF_DATE",
             "TOTAL_CLAIMS": "TOTAL_CT",
             "OPEN_CLAIMS": "OPEN_CT",
             "CLOSED_CLAIMS": "CLOSED_CT",
@@ -210,12 +246,27 @@ def load_data_snowflake_keypair() -> pd.DataFrame:
     )
 
     df["ASOF_DATE"] = pd.to_datetime(df["ASOF_DATE"], errors="coerce").dt.date
+
     for col in ["TOTAL_CT", "OPEN_CT", "CLOSED_CT"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0).astype(int)
+
     for col in ["PAID_AMT", "OUTSTANDING_AMT", "INCURRED_AMT"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0)
+
+    # One row per date is expected. If duplicates exist, aggregate defensively.
+    if df["ASOF_DATE"].duplicated().any():
+        df = (
+            df.groupby("ASOF_DATE", dropna=False, as_index=False)
+            .agg(
+                TOTAL_CT=("TOTAL_CT", "max"),
+                OPEN_CT=("OPEN_CT", "max"),
+                CLOSED_CT=("CLOSED_CT", "max"),
+                PAID_AMT=("PAID_AMT", "max"),
+                OUTSTANDING_AMT=("OUTSTANDING_AMT", "max"),
+                INCURRED_AMT=("INCURRED_AMT", "max"),
+            )
+            .sort_values("ASOF_DATE")
+        )
 
     return df
 
@@ -230,7 +281,9 @@ def load_data(source: str, csv_path: str) -> pd.DataFrame:
 # ============================================================
 # METRIC COMPUTATION
 # ============================================================
-def latest_and_prior_by_asof(df_scoped: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[date], Optional[date]]:
+def latest_and_prior_by_asof(
+    df_scoped: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[date], Optional[date]]:
     if df_scoped is None or len(df_scoped) == 0 or "ASOF_DATE" not in df_scoped.columns:
         return df_scoped, None, None, None
 
@@ -440,7 +493,9 @@ with main_col:
     k4.metric("Outstanding", fmt_money_short(outstanding))
     k5.metric("High Severity Features" if SOURCE == "csv" else "High Severity", f"{high_sev_ct:,}")
 
-    st.caption(f"Full totals: Total Incurred {fmt_money(incurred)} | Paid {fmt_money(paid)} | Outstanding {fmt_money(outstanding)}")
+    st.caption(
+        f"Full totals: Total Incurred {fmt_money(incurred)} | Paid {fmt_money(paid)} | Outstanding {fmt_money(outstanding)}"
+    )
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Today’s Headlines")
@@ -470,14 +525,24 @@ with main_col:
 
         with tab_open:
             if "ACCIDENT_YEAR" in f_latest.columns:
-                by_year = f_latest.groupby("ACCIDENT_YEAR", dropna=True).size().reset_index(name="Feature Count").sort_values("ACCIDENT_YEAR")
+                by_year = (
+                    f_latest.groupby("ACCIDENT_YEAR", dropna=True)
+                    .size()
+                    .reset_index(name="Feature Count")
+                    .sort_values("ACCIDENT_YEAR")
+                )
                 st.bar_chart(by_year.set_index("ACCIDENT_YEAR")["Feature Count"])
             else:
                 st.info("ACCIDENT_YEAR not available in this dataset.")
 
         with tab_incurred:
             if "ACCIDENT_YEAR" in f_latest.columns and "INCURRED_AMT" in f_latest.columns:
-                inc_by_year = f_latest.groupby("ACCIDENT_YEAR", dropna=True)["INCURRED_AMT"].sum().reset_index().sort_values("ACCIDENT_YEAR")
+                inc_by_year = (
+                    f_latest.groupby("ACCIDENT_YEAR", dropna=True)["INCURRED_AMT"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("ACCIDENT_YEAR")
+                )
                 st.bar_chart(inc_by_year.set_index("ACCIDENT_YEAR")["INCURRED_AMT"])
             else:
                 st.info("ACCIDENT_YEAR / INCURRED_AMT not available in this dataset.")
