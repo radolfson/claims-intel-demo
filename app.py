@@ -397,7 +397,7 @@ with main_col:
     k2.metric("Total Incurred", fmt_money(incurred))
     k3.metric("Paid", fmt_money(paid))
     k4.metric("Outstanding", fmt_money(outstanding))
-    k5.metric("Closed Claims", f"{closed_claims:,}")
+    k5.metric("Non-Open Claims", f"{closed_claims:,}")
 
     if metric_note:
         st.info(str(metric_note))
