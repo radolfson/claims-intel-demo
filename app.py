@@ -50,7 +50,133 @@ def load_demo_features(*, client_code: str | None = None, line_code: str | None 
 # -----------------------------
 # Minimal UI helpers (no lib.ui required)
 # -----------------------------
-def sidebar_filters(df: pd.DataFrame, defaults:_
+def sidebar_filters(df: pd.DataFrame, defaults: dict | None = None) -> dict:
+    defaults = defaults or {}
+    f: dict = {}
+
+    st.sidebar.header("Filters")
+
+    # Date range
+    if "REPORTED_DATE" in df.columns and df["REPORTED_DATE"].notna().any():
+        min_d = df["REPORTED_DATE"].min()
+        max_d = df["REPORTED_DATE"].max()
+        start, end = st.sidebar.date_input(
+            "Reported date range",
+            value=(defaults.get("reported_start", min_d), defaults.get("reported_end", max_d)),
+            min_value=min_d,
+            max_value=max_d,
+        )
+        f["reported_start"] = start
+        f["reported_end"] = end
+
+    # Open / Closed
+    if "IS_OPEN" in df.columns:
+        f["open_only"] = st.sidebar.checkbox("Open claims only", value=defaults.get("open_only", False))
+
+    # Claim status
+    if "CLAIM_STATUS_CODE" in df.columns:
+        statuses = sorted([x for x in df["CLAIM_STATUS_CODE"].dropna().unique()])
+        chosen = st.sidebar.multiselect("Claim Status", statuses, default=defaults.get("claim_status", statuses))
+        f["claim_status"] = chosen
+
+    # Client code (if present)
+    if "CLIENT_CODE" in df.columns:
+        clients = sorted([x for x in df["CLIENT_CODE"].dropna().unique()])
+        chosen = st.sidebar.multiselect("Client", clients, default=defaults.get("clients", clients))
+        f["clients"] = chosen
+
+    return f
+
+
+def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
+    out = df.copy()
+
+    # Date range
+    if "REPORTED_DATE" in out.columns and f.get("reported_start") and f.get("reported_end"):
+        out = out[
+            (out["REPORTED_DATE"] >= f["reported_start"]) &
+            (out["REPORTED_DATE"] <= f["reported_end"])
+        ]
+
+    # Open only
+    if f.get("open_only") and "IS_OPEN" in out.columns:
+        out = out[out["IS_OPEN"] == 1]
+
+    # Status filter
+    if "CLAIM_STATUS_CODE" in out.columns and isinstance(f.get("claim_status"), list) and f["claim_status"]:
+        out = out[out["CLAIM_STATUS_CODE"].isin(f["claim_status"])]
+
+    # Client filter
+    if "CLIENT_CODE" in out.columns and isinstance(f.get("clients"), list) and f["clients"]:
+        out = out[out["CLIENT_CODE"].isin(f["clients"])]
+
+    return out
+
+
+def render_kpis(dff: pd.DataFrame, cfg: dict) -> None:
+    # Safe KPI calculations
+    total = len(dff)
+
+    incurred = None
+    if "INCURRED_AMT" in dff.columns:
+        incurred = float(pd.to_numeric(dff["INCURRED_AMT"], errors="coerce").fillna(0).sum())
+
+    open_count = None
+    if "IS_OPEN" in dff.columns:
+        open_count = int((pd.to_numeric(dff["IS_OPEN"], errors="coerce").fillna(0) == 1).sum())
+
+    sev_thresh = cfg.get("severity_threshold")
+    high_sev = None
+    if sev_thresh is not None and "INCURRED_AMT" in dff.columns:
+        amt = pd.to_numeric(dff["INCURRED_AMT"], errors="coerce").fillna(0)
+        high_sev = int((amt >= float(sev_thresh)).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Features", f"{total:,}")
+    c2.metric("Open", f"{open_count:,}" if open_count is not None else "—")
+    c3.metric("Total Incurred", fmt_currency(incurred))
+    c4.metric(f"High Sev (≥ {cfg.get('severity_threshold', 0):,})", f"{high_sev:,}" if high_sev is not None else "—")
+
+
+# -----------------------------
+# Email stub (no lib.emailer required)
+# -----------------------------
+def send_demo_email(*, to_email: str, subject: str, html_body: str) -> None:
+    """
+    Demo-safe behavior: show the email content and optionally send via SMTP only if secrets exist.
+    This prevents the app from crashing if email isn't configured.
+    """
+    st.info("Email sending is disabled in this minimal demo build unless SMTP secrets are configured.")
+    st.code(f"TO: {to_email}\nSUBJECT: {subject}", language="text")
+    st.markdown(html_body, unsafe_allow_html=True)
+
+
+# -----------------------------
+# Your existing helper functions can stay
+# -----------------------------
+def severity_buckets(df: pd.DataFrame) -> pd.DataFrame:
+    bins = [-1, 10_000, 50_000, 250_000, 1_000_000_000]
+    labels = ["< $10k", "$10k–$50k", "$50k–$250k", "≥ $250k"]
+    tmp = df.copy()
+    tmp["SEV_BUCKET"] = pd.cut(tmp["INCURRED_AMT"].fillna(0), bins=bins, labels=labels)
+    out = tmp.groupby("SEV_BUCKET", dropna=False).size().reset_index(name="Feature Count")
+    return out
+
+
+def fmt_currency(value) -> str:
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return "—"
+        return f"${float(value):,.0f}"
+    except Exception:
+        return "—"
+
+
+def get_dashboard_url(cfg: dict) -> str:
+    base_url = st.secrets.get("app", {}).get("base_url")
+    if base_url:
+        return f"{base_url}?client={cfg['client_slug']}"
+    return f"/?client={cfg['client_slug']}"
 
                             )
                             st.success(f"Sent to {to_email}.")
