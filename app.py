@@ -186,6 +186,41 @@ def sf_read(sql: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=True, ttl=900)
+
+def _parse_fqn(obj_name: str, default_db: str, default_schema: str) -> Tuple[str, str, str]:
+    """Return (db, schema, name) for an object reference.
+    Accepts NAME, SCHEMA.NAME, or DB.SCHEMA.NAME.
+    """
+    parts = [p.strip().strip('"') for p in obj_name.split(".") if p.strip()]
+    if len(parts) == 1:
+        return default_db, default_schema, parts[0]
+    if len(parts) == 2:
+        return default_db, parts[0], parts[1]
+    return parts[0], parts[1], parts[2]
+
+
+def _get_columns_for_object(conn, obj_name: str, default_db: str, default_schema: str) -> set[str]:
+    db, schema, name = _parse_fqn(obj_name, default_db, default_schema)
+    sql = f"""
+    SELECT UPPER(column_name) AS column_name
+    FROM {db}.INFORMATION_SCHEMA.COLUMNS
+    WHERE UPPER(table_schema) = UPPER('{schema}')
+      AND UPPER(table_name)   = UPPER('{name}')
+    ORDER BY ordinal_position
+    """
+    df = sf_read(sql, conn)
+    return set(df['COLUMN_NAME'].tolist()) if not df.empty else set()
+
+
+def _pick_date_column(conn, obj_name: str, default_db: str, default_schema: str, preferred: list[str]) -> str:
+    cols = _get_columns_for_object(conn, obj_name, default_db, default_schema)
+    for c in preferred:
+        if c.upper() in cols:
+            return c.upper()
+    raise ValueError(
+        f"Could not find any expected date column in {obj_name}. Found columns: {sorted(cols)}"
+    )
+
 def load_snowflake() -> Tuple[pd.DataFrame, pd.DataFrame]:
     daily_sql = f"""
     SELECT
@@ -200,14 +235,21 @@ def load_snowflake() -> Tuple[pd.DataFrame, pd.DataFrame]:
     ORDER BY REPORTED_DATE;
     """
 
-    detail_sql = f"""
+    detail_date_col = _pick_date_column(
+        conn,
+        SF_DETAIL_VIEW,
+        SNOWFLAKE_DATABASE,
+        SNOWFLAKE_SCHEMA,
+        preferred=["REPORTED_DATE", "REPORT_DATE", "LOSS_DATE", "REPORT_DATE_DAY"],
+    )
+
+detail_sql = f"""
     SELECT *
     FROM {SF_DETAIL_VIEW}
-    WHERE COALESCE(REPORTED_DATE, REPORT_DATE) >= DATEADD('day', -{DETAIL_DAYS_BACK}, CURRENT_DATE())
+    WHERE {detail_date_col} >= DATEADD('day', -{DETAIL_DAYS_BACK}, CURRENT_DATE())
     ;
     """
-
-    daily = normalize_daily(sf_read(daily_sql))
+daily = normalize_daily(sf_read(daily_sql))
     detail = normalize_detail(sf_read(detail_sql))
     return daily, detail
 
