@@ -1,6 +1,6 @@
 import os
 from datetime import date
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -11,15 +11,16 @@ import snowflake.connector
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
+
 # ============================================================
 # PAGE
 # ============================================================
 st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
 
+
 # ============================================================
 # SETTINGS
 # ============================================================
-
 def get_setting(name: str, default: Optional[str] = None) -> Optional[str]:
     """Read Streamlit Community Cloud secrets first, then environment variables."""
     try:
@@ -36,21 +37,26 @@ def get_data_source() -> str:
 
 SOURCE = get_data_source()
 
-# If you ever fall back to CSV, it is explicit.
+# CSV fallback (only if DATA_SOURCE=csv)
 DATA_PATH = os.getenv("DEMO_DATA_PATH", "demo_features_latest.csv")
 
-# Snowflake objects (keep these together so you can change them in one place)
-SF_DAILY_VIEW = os.getenv("SF_DAILY_VIEW", "NARS.PROCESSED.V_FEATURE_DAILY_STATUS")
-# For tonight, we tolerate STAGING for claim-list/detail. Replace with a PROCESSED contract view later.
-SF_DETAIL_VIEW = os.getenv("SF_DETAIL_VIEW", "NARS.STAGING.STG_TRANSPORTATION_CLAIMS")
+# Snowflake objects
+SF_DAILY_VIEW = get_setting("SF_DAILY_VIEW", "NARS.PROCESSED.V_FEATURE_DAILY_STATUS")
+SF_DETAIL_VIEW = get_setting("SF_DETAIL_VIEW", "NARS.PROCESSED.V_TRANSPORTATION_CLAIMS_DETAIL")
+DETAIL_DAYS_BACK = int(get_setting("DETAIL_DAYS_BACK", "180"))
 
-# How much detail data to pull for filters/tables (keeps the app fast)
-DETAIL_DAYS_BACK = int(os.getenv("DETAIL_DAYS_BACK", "180"))
+# Connection defaults
+SNOWFLAKE_ACCOUNT = get_setting("SNOWFLAKE_ACCOUNT")
+SNOWFLAKE_USER = get_setting("SNOWFLAKE_USER")
+SNOWFLAKE_WAREHOUSE = get_setting("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
+SNOWFLAKE_DATABASE = get_setting("SNOWFLAKE_DATABASE", "NARS")
+SNOWFLAKE_SCHEMA = get_setting("SNOWFLAKE_SCHEMA", "PROCESSED")
+SNOWFLAKE_ROLE = get_setting("SNOWFLAKE_ROLE")
+
 
 # ============================================================
 # UI HELPERS
 # ============================================================
-
 def fmt_money(x: float) -> str:
     try:
         x = float(x)
@@ -85,27 +91,21 @@ def normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
-    # Snowflake returns uppercase by default
-    cols = {c.upper(): c for c in df.columns}
+    df = df.rename(columns={c: c.upper() for c in df.columns})
 
-    # Required (from your DESC screenshot)
     required = ["REPORTED_DATE", "TOTAL_CLAIMS", "OPEN_CLAIMS", "PAID", "OUTSTANDING", "INCURRED"]
-    for r in required:
-        if r not in cols:
-            raise ValueError(
-                f"Daily view missing expected column {r}. Found: {list(df.columns)}. "
-                f"Point SF_DAILY_VIEW to the right object."
-            )
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Daily view missing columns: {missing}. Found: {list(df.columns)}. "
+            f"SF_DAILY_VIEW currently = {SF_DAILY_VIEW}"
+        )
 
-    # Standardize to upper-case column labels
-    df = df.rename(columns={cols[k]: k for k in cols})
+    df["REPORTED_DATE"] = pd.to_datetime(df["REPORTED_DATE"], errors="coerce").dt.date
 
-    # Ensure date type
-    df["REPORTED_DATE"] = pd.to_datetime(df["REPORTED_DATE"]).dt.date
-
-    # Numeric
     for c in ["TOTAL_CLAIMS", "OPEN_CLAIMS"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
     for c in ["PAID", "OUTSTANDING", "INCURRED"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -119,7 +119,6 @@ def normalize_detail(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     df = df.rename(columns={c: c.upper() for c in df.columns})
-    # Try common date columns
     for dcol in ["REPORTED_DATE", "REPORT_DATE", "LOSS_DATE", "CLOSED_DATE"]:
         if dcol in df.columns:
             df[dcol] = pd.to_datetime(df[dcol], errors="coerce").dt.date
@@ -129,13 +128,13 @@ def normalize_detail(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # SNOWFLAKE CONNECTION
 # ============================================================
-
-def _load_private_key() -> bytes:
-    pkey = get_setting("SNOWFLAKE_PRIVATE_KEY")
+def _load_private_key_der() -> bytes:
+    # In your secrets you showed it as private_key_pem; handle both names:
+    pkey = get_setting("SNOWFLAKE_PRIVATE_KEY") or get_setting("private_key_pem")
     if not pkey:
-        raise ValueError("Missing SNOWFLAKE_PRIVATE_KEY in secrets/env.")
+        raise ValueError("Missing SNOWFLAKE_PRIVATE_KEY (or private_key_pem) in secrets/env.")
 
-    # Supports: raw PEM text, or base64 of PEM text
+    # raw PEM text, or base64 of PEM
     if "BEGIN" not in pkey:
         import base64
         pkey = base64.b64decode(pkey).decode("utf-8")
@@ -153,44 +152,34 @@ def _load_private_key() -> bytes:
 
 
 def sf_connect():
-    account = get_setting("SNOWFLAKE_ACCOUNT")
-    user = get_setting("SNOWFLAKE_USER")
-    warehouse = get_setting("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
-    database = get_setting("SNOWFLAKE_DATABASE", "NARS")
-    schema = get_setting("SNOWFLAKE_SCHEMA", "PROCESSED")
-    role = get_setting("SNOWFLAKE_ROLE")
-
-    if not account or not user:
+    if not SNOWFLAKE_ACCOUNT or not SNOWFLAKE_USER:
         raise ValueError("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in secrets/env.")
 
-    pkb = _load_private_key()
+    pkb = _load_private_key_der()
 
     kwargs = dict(
-        account=account,
-        user=user,
+        account=SNOWFLAKE_ACCOUNT,
+        user=SNOWFLAKE_USER,
         private_key=pkb,
-        warehouse=warehouse,
-        database=database,
-        schema=schema,
+        warehouse=SNOWFLAKE_WAREHOUSE,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA,
     )
-    if role:
-        kwargs["role"] = role
+    if SNOWFLAKE_ROLE:
+        kwargs["role"] = SNOWFLAKE_ROLE
 
     return snowflake.connector.connect(**kwargs)
 
 
 @st.cache_data(show_spinner=False, ttl=900)
 def sf_read(sql: str) -> pd.DataFrame:
+    """Cached query runner (new connection each call)."""
     with sf_connect() as conn:
         return pd.read_sql(sql, conn)
 
 
-@st.cache_data(show_spinner=True, ttl=900)
-
 def _parse_fqn(obj_name: str, default_db: str, default_schema: str) -> Tuple[str, str, str]:
-    """Return (db, schema, name) for an object reference.
-    Accepts NAME, SCHEMA.NAME, or DB.SCHEMA.NAME.
-    """
+    """Return (db, schema, name) for NAME, SCHEMA.NAME, DB.SCHEMA.NAME."""
     parts = [p.strip().strip('"') for p in obj_name.split(".") if p.strip()]
     if len(parts) == 1:
         return default_db, default_schema, parts[0]
@@ -199,57 +188,68 @@ def _parse_fqn(obj_name: str, default_db: str, default_schema: str) -> Tuple[str
     return parts[0], parts[1], parts[2]
 
 
-def _get_columns_for_object(conn, obj_name: str, default_db: str, default_schema: str) -> set[str]:
-    db, schema, name = _parse_fqn(obj_name, default_db, default_schema)
+def _get_columns_for_object(obj_name: str) -> List[str]:
+    """Non-cached metadata read (kept simple and robust)."""
+    db, schema, name = _parse_fqn(obj_name, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA)
     sql = f"""
-    SELECT UPPER(column_name) AS column_name
-    FROM {db}.INFORMATION_SCHEMA.COLUMNS
-    WHERE UPPER(table_schema) = UPPER('{schema}')
-      AND UPPER(table_name)   = UPPER('{name}')
-    ORDER BY ordinal_position
+        SELECT UPPER(column_name) AS column_name
+        FROM {db}.INFORMATION_SCHEMA.COLUMNS
+        WHERE UPPER(table_schema) = UPPER('{schema}')
+          AND UPPER(table_name)   = UPPER('{name}')
+        ORDER BY ordinal_position
     """
-    df = sf_read(sql, conn)
-    return set(df['COLUMN_NAME'].tolist()) if not df.empty else set()
+    df = sf_read(sql)
+    return df["COLUMN_NAME"].tolist() if not df.empty else []
 
 
-def _pick_date_column(conn, obj_name: str, default_db: str, default_schema: str, preferred: list[str]) -> str:
-    cols = _get_columns_for_object(conn, obj_name, default_db, default_schema)
+def _pick_detail_date_column(obj_name: str) -> str:
+    cols = set(_get_columns_for_object(obj_name))
+
+    # Prefer exactly what your detail view actually has (from your screenshot)
+    preferred = [
+        "REPORTED_DATE",   # you DO have this
+        "REPORT_DATE",     # you do NOT, but we’ll tolerate if present elsewhere
+        "LOSS_DATE",
+        "CLOSED_DATE",
+        "DATE_DAY",
+        "REPORT_DATE_DAY",
+    ]
     for c in preferred:
-        if c.upper() in cols:
-            return c.upper()
-    raise ValueError(
-        f"Could not find any expected date column in {obj_name}. Found columns: {sorted(cols)}"
-    )
+        if c in cols:
+            return c
+
+    # Last resort: find anything with DATE in the name
+    date_like = [c for c in cols if "DATE" in c]
+    if date_like:
+        return sorted(date_like)[0]
+
+    raise ValueError(f"Could not find a usable date column in {obj_name}. Columns: {sorted(cols)}")
+
 
 def load_snowflake() -> Tuple[pd.DataFrame, pd.DataFrame]:
     daily_sql = f"""
-    SELECT
-      REPORTED_DATE,
-      TOTAL_CLAIMS,
-      OPEN_CLAIMS,
-      PAID,
-      OUTSTANDING,
-      INCURRED,
-      METRIC_NOTE
-    FROM {SF_DAILY_VIEW}
-    ORDER BY REPORTED_DATE;
+        SELECT
+          REPORTED_DATE,
+          TOTAL_CLAIMS,
+          OPEN_CLAIMS,
+          PAID,
+          OUTSTANDING,
+          INCURRED,
+          METRIC_NOTE
+        FROM {SF_DAILY_VIEW}
+        ORDER BY REPORTED_DATE;
     """
 
-    detail_date_col = _pick_date_column(
-        conn,
-        SF_DETAIL_VIEW,
-        SNOWFLAKE_DATABASE,
-        SNOWFLAKE_SCHEMA,
-        preferred=["REPORTED_DATE", "REPORT_DATE", "LOSS_DATE", "REPORT_DATE_DAY"],
-    )
+    # Detail: dynamically choose the date column so we don't explode on REPORT_DATE again
+    detail_date_col = _pick_detail_date_column(SF_DETAIL_VIEW)
 
-detail_sql = f"""
-    SELECT *
-    FROM {SF_DETAIL_VIEW}
-    WHERE {detail_date_col} >= DATEADD('day', -{DETAIL_DAYS_BACK}, CURRENT_DATE())
-    ;
+    detail_sql = f"""
+        SELECT *
+        FROM {SF_DETAIL_VIEW}
+        WHERE {detail_date_col} >= DATEADD('day', -{DETAIL_DAYS_BACK}, CURRENT_DATE())
     """
-daily = normalize_daily(sf_read(daily_sql))
+
+    daily = normalize_daily(sf_read(daily_sql))
     detail = normalize_detail(sf_read(detail_sql))
     return daily, detail
 
@@ -263,7 +263,7 @@ def load_csv(csv_path: str) -> pd.DataFrame:
 
 
 # ============================================================
-# LOAD
+# LOAD DATA
 # ============================================================
 if SOURCE == "csv":
     if not os.path.exists(DATA_PATH):
@@ -279,7 +279,13 @@ else:
         st.exception(e)
         st.stop()
 
+
+# ============================================================
+# SIDEBAR DEBUG
+# ============================================================
 st.sidebar.markdown(f"**Data source:** `{SOURCE.upper()}`")
+st.sidebar.markdown(f"**Daily view:** `{SF_DAILY_VIEW}`")
+st.sidebar.markdown(f"**Detail view:** `{SF_DETAIL_VIEW}`")
 
 with st.sidebar.expander("Debug", expanded=False):
     st.write("Daily rows:", len(daily_df))
@@ -287,6 +293,7 @@ with st.sidebar.expander("Debug", expanded=False):
         st.write("Min REPORTED_DATE:", daily_df["REPORTED_DATE"].min())
         st.write("Max REPORTED_DATE:", daily_df["REPORTED_DATE"].max())
     st.dataframe(daily_df.tail(10), use_container_width=True)
+
 
 # ============================================================
 # HEADER
@@ -300,13 +307,15 @@ with right:
     st.title("Claims Intelligence – Daily Summary")
     st.write("Client-facing daily KPI rollup sourced from Snowflake.")
 
+
 # ============================================================
 # LAYOUT
 # ============================================================
 main_col, filter_col = st.columns([4, 1], gap="large")
 
+
 # ============================================================
-# AS-OF + KPI ROW
+# AS-OF + KPIs
 # ============================================================
 if daily_df.empty:
     st.error("Daily KPI dataset is empty.")
@@ -323,8 +332,9 @@ outstanding = float(latest_row["OUTSTANDING"]) if pd.notna(latest_row["OUTSTANDI
 incurred = float(latest_row["INCURRED"]) if pd.notna(latest_row["INCURRED"]) else 0.0
 metric_note = latest_row.get("METRIC_NOTE", None)
 
+
 # ============================================================
-# FILTERS (SNOWFLAKE DETAIL)
+# FILTERS (DETAIL)
 # ============================================================
 scoped_detail = detail_df.copy()
 filter_summary = "None (All data)"
@@ -333,22 +343,21 @@ with filter_col:
     st.markdown("### Filters")
 
     if SOURCE != "snowflake" or detail_df.empty:
-        st.info("Detail filters need claim-level data. (SF_DETAIL_VIEW is empty or DATA_SOURCE != snowflake.)")
+        st.info("Detail filters need claim-level data. (Detail view is empty or DATA_SOURCE != snowflake.)")
     else:
-        # Try to offer filters when columns exist
-        def opt(col: str):
+        def has(col: str) -> bool:
             return col in scoped_detail.columns
 
         parts = []
 
-        # Restrict detail to last N days and non-null report date
-        if opt("REPORTED_DATE"):
+        # Ensure date is not null if available
+        if has("REPORTED_DATE"):
             scoped_detail = scoped_detail[scoped_detail["REPORTED_DATE"].notna()]
 
-        # State-like
+        # State-ish
         state_col = None
         for c in ["LOSS_STATE", "STATE", "POLICY_STATE", "POLICY_LOCATION_STATE"]:
-            if opt(c):
+            if has(c):
                 state_col = c
                 break
         if state_col:
@@ -359,7 +368,7 @@ with filter_col:
                 parts.append(f"{state_col}={sel_state}")
 
         # Adjuster
-        adj_col = "ADJUSTER_ID" if opt("ADJUSTER_ID") else ("ADJUSTER" if opt("ADJUSTER") else None)
+        adj_col = "ADJUSTER_ID" if has("ADJUSTER_ID") else ("ADJUSTER" if has("ADJUSTER") else None)
         if adj_col:
             adjs = ["All"] + sorted([a for a in scoped_detail[adj_col].dropna().unique().tolist()])
             sel_adj = st.selectbox("Adjuster", adjs, index=0)
@@ -367,15 +376,15 @@ with filter_col:
                 scoped_detail = scoped_detail[scoped_detail[adj_col] == sel_adj]
                 parts.append(f"{adj_col}={sel_adj}")
 
-        # Open-only toggle
-        is_open_col = "IS_OPEN" if opt("IS_OPEN") else None
-        if is_open_col:
+        # Open-only
+        if has("IS_OPEN"):
             open_only = st.toggle("Open claims only", value=True)
             if open_only:
-                scoped_detail = scoped_detail[scoped_detail[is_open_col].fillna(0).astype(int) == 1]
+                scoped_detail = scoped_detail[scoped_detail["IS_OPEN"].fillna(0).astype(int) == 1]
                 parts.append("OpenOnly")
 
         filter_summary = ", ".join(parts) if parts else "None (All data)"
+
 
 # ============================================================
 # MAIN CONTENT
@@ -395,7 +404,7 @@ with main_col:
 
     st.caption(f"In scope: {filter_summary}")
 
-    # Trend (daily)
+    # Trend
     st.subheader("Trend")
     trend = daily_df.copy()
     trend["REPORTED_DATE"] = pd.to_datetime(trend["REPORTED_DATE"])
@@ -406,36 +415,34 @@ with main_col:
     with c2:
         st.line_chart(trend.set_index("REPORTED_DATE")["INCURRED"])
 
-    # Detail
+    # Detail table
     st.subheader("Open claims (detail)")
     if SOURCE == "snowflake" and not scoped_detail.empty:
-        # Choose a reasonable set of columns to show if they exist
-        preferred = [
+        preferred_cols = [
             "CLAIM_ID",
             "CLAIM_NUMBER",
             "CLIENT_CODE",
             "CLAIM_TYPE_CODE",
-            "POLICY_OID",
+            "POLICY_ID",
+            "POLICY_LOCATION_OID",
             "ADJUSTER_ID",
             "REPORTED_DATE",
             "LOSS_DATE",
             "CLOSED_DATE",
-            "CLAIM_STATUS",
+            "CLAIM_STATUS_CODE",
             "IS_OPEN",
+            "IS_CLOSED",
+            "IS_LITIGATION",
         ]
-        show_cols = [c for c in preferred if c in scoped_detail.columns]
+        show_cols = [c for c in preferred_cols if c in scoped_detail.columns]
         if not show_cols:
             show_cols = scoped_detail.columns.tolist()[:12]
 
-        st.dataframe(
-            scoped_detail.sort_values(
-                [c for c in ["REPORTED_DATE", "CLAIM_ID"] if c in scoped_detail.columns],
-                ascending=False,
-            )[show_cols].head(500),
-            use_container_width=True,
-        )
+        sort_cols = [c for c in ["REPORTED_DATE", "CLAIM_ID"] if c in scoped_detail.columns]
+        df_show = scoped_detail.sort_values(sort_cols, ascending=False) if sort_cols else scoped_detail
 
-        # Counts by adjuster (if available)
+        st.dataframe(df_show[show_cols].head(500), use_container_width=True)
+
         if "ADJUSTER_ID" in scoped_detail.columns:
             st.subheader("Open claims by adjuster")
             by_adj = (
