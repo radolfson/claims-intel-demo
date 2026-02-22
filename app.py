@@ -35,11 +35,14 @@ def load_features_csv(path: str = DATA_FILE) -> pd.DataFrame:
     if "is_open_inventory" in df.columns:
         df["is_open_inventory"] = pd.to_numeric(df["is_open_inventory"], errors="coerce").fillna(0).astype(int)
     else:
-        # derive if missing
         if "feature_status" in df.columns:
             df["is_open_inventory"] = df["feature_status"].isin(list(STATUS_OPEN_SET)).astype(int)
         else:
             df["is_open_inventory"] = 0
+
+    # Ensure litigated flag if missing (demo safety)
+    if "is_litigated" in df.columns:
+        df["is_litigated"] = pd.to_numeric(df["is_litigated"], errors="coerce").fillna(0).astype(int)
 
     return df
 
@@ -59,9 +62,6 @@ def safe_list(series: pd.Series) -> list:
 
 
 def init_filter_state(df: pd.DataFrame) -> None:
-    """
-    Initialize session_state defaults once.
-    """
     if st.session_state.get("_filters_initialized"):
         return
 
@@ -73,7 +73,7 @@ def init_filter_state(df: pd.DataFrame) -> None:
     st.session_state["f_coverage"] = "All Coverage"
     st.session_state["f_adjuster"] = "All Adjusters"
 
-    # Expanded filters (BRD-style)
+    # Expanded filters
     st.session_state["f_lob"] = "All Lines"
     st.session_state["f_status"] = "All Statuses"
     st.session_state["f_cause"] = "All Causes"
@@ -86,7 +86,6 @@ def init_filter_state(df: pd.DataFrame) -> None:
 
 
 def reset_filters() -> None:
-    # Wipe the initialized flag and rebuild defaults
     for k in list(st.session_state.keys()):
         if k.startswith("f_") or k == "_filters_initialized":
             del st.session_state[k]
@@ -162,7 +161,9 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
             return "No features in the current filter selection."
         lines = []
         for _, r in top.iterrows():
-            lines.append(f"- {r.get('feature_key','(feature)')} | {r.get('state','')} | {r.get('accident_year','')} | {fmt_currency(r.get('incurred_amount',0))}")
+            lines.append(
+                f"- {r.get('feature_key','(feature)')} | {r.get('state','')} | {r.get('accident_year','')} | {fmt_currency(r.get('incurred_amount',0))}"
+            )
         return "Top 10 by incurred:\n" + "\n".join(lines)
 
     if "open" in ql and "features" in ql:
@@ -170,6 +171,8 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
         return f"Open inventory features: {open_ct:,}."
 
     if "highest" in ql and "incurred" in ql and "state" in ql:
+        if "state" not in dff.columns:
+            return "State data not available in the current dataset."
         by_state = dff.groupby("state", dropna=False)["incurred_amount"].sum().sort_values(ascending=False)
         if by_state.empty:
             return "No state data in the current filter selection."
@@ -190,7 +193,7 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 
 
 # =========================================
-# Headline generation
+# Headline generation (SAFE for 0/1 states or 0/1 years)
 # =========================================
 def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
     open_ct = int((dff["is_open_inventory"] == 1).sum())
@@ -201,32 +204,52 @@ def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
     hs_pct = (hs_ct / open_ct * 100) if open_ct else 0.0
 
     total_incurred = float(dff["incurred_amount"].sum())
-    total_paid = float(dff["paid_amount"].sum())
     total_out = float(dff["outstanding_amount"].sum())
     out_pct = (total_out / total_incurred * 100) if total_incurred else 0.0
 
-    # Accident year concentration
+    # Accident year concentration (safe)
     if "accident_year" in dff.columns and total_ct:
         ay = dff.groupby("accident_year").size().sort_values(ascending=False)
         top_years = ay.index[:2].tolist()
-        top_share = ay.iloc[:2].sum() / total_ct * 100
-        year_msg = f"Open features total {open_ct:,}, concentrated in accident years {top_years[0]}–{top_years[1]} (~{top_share:.1f}% of inventory)."
+
+        if len(top_years) >= 2:
+            top_share = ay.iloc[:2].sum() / total_ct * 100
+            year_msg = (
+                f"Open features total {open_ct:,}, concentrated in accident years "
+                f"{top_years[0]}–{top_years[1]} (~{top_share:.1f}% of inventory)."
+            )
+        elif len(top_years) == 1:
+            year_msg = f"Open features total {open_ct:,}, concentrated in accident year {top_years[0]} (filtered selection)."
+        else:
+            year_msg = f"Open features total {open_ct:,} (~{open_pct:.1f}% of filtered inventory)."
     else:
         year_msg = f"Open features total {open_ct:,} (~{open_pct:.1f}% of filtered inventory)."
 
-    # State concentration
+    # State concentration (safe)  ✅ FIXES YOUR CRASH
     if "state" in dff.columns and total_ct:
         stc = dff.groupby("state").size().sort_values(ascending=False)
         top_states = stc.index[:2].tolist()
-        st_share = stc.iloc[:2].sum() / total_ct * 100
-        state_msg = f"{top_states[0]} and {top_states[1]} account for ~{st_share:.1f}% of feature count."
+
+        if len(top_states) >= 2:
+            st_share = stc.iloc[:2].sum() / total_ct * 100
+            state_msg = f"{top_states[0]} and {top_states[1]} account for ~{st_share:.1f}% of feature count."
+        elif len(top_states) == 1:
+            state_msg = f"{top_states[0]} accounts for 100% of feature count (filtered selection)."
+        else:
+            state_msg = "Geographic concentration not available for current filters."
     else:
         state_msg = "Geographic concentration not available for current filters."
 
     st.markdown("### Today’s Headlines")
     st.info(year_msg)
-    st.success(f"High severity features represent {hs_pct:.1f}% of open inventory ({hs_ct:,} features at ≥ {fmt_currency(sev_thresh)}).")
-    st.warning(f"Total incurred stands at {fmt_currency(total_incurred)} with {fmt_currency(total_out)} outstanding ({out_pct:.1f}% case reserves).")
+    st.success(
+        f"High severity features represent {hs_pct:.1f}% of open inventory "
+        f"({hs_ct:,} features at ≥ {fmt_currency(sev_thresh)})."
+    )
+    st.warning(
+        f"Total incurred stands at {fmt_currency(total_incurred)} with "
+        f"{fmt_currency(total_out)} outstanding ({out_pct:.1f}% case reserves)."
+    )
     st.info(state_msg)
 
 
@@ -248,13 +271,52 @@ def render_kpis(dff: pd.DataFrame, sev_thresh: float) -> None:
     c5.metric("High Severity Features", f"{high_sev:,}")
 
 
-def render_metric_rolodex(dff: pd.DataFrame) -> None:
-    st.markdown("### Metric Rolodex (Accident Year)")
+# ✅ UPDATED: Dropdown metric rolodex like the mock
+def render_metric_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Metric Rolodex")
+
+    metric = st.selectbox(
+        "Metric",
+        [
+            "Open Features",
+            "Total Features",
+            "Total Incurred",
+            "Paid",
+            "Outstanding",
+            "High Severity Features",
+        ],
+        index=0,
+        label_visibility="collapsed",
+    )
+
     if "accident_year" not in dff.columns:
         st.caption("No accident_year available.")
         return
-    yr = dff.groupby("accident_year").size().reset_index(name="Feature Count").sort_values("accident_year")
-    st.bar_chart(yr.set_index("accident_year"))
+
+    tmp = dff.copy()
+
+    if metric == "Open Features":
+        tmp = tmp[tmp["is_open_inventory"] == 1]
+        chart = tmp.groupby("accident_year").size().reset_index(name="Value")
+
+    elif metric == "Total Features":
+        chart = tmp.groupby("accident_year").size().reset_index(name="Value")
+
+    elif metric == "Total Incurred":
+        chart = tmp.groupby("accident_year")["incurred_amount"].sum().reset_index(name="Value")
+
+    elif metric == "Paid":
+        chart = tmp.groupby("accident_year")["paid_amount"].sum().reset_index(name="Value")
+
+    elif metric == "Outstanding":
+        chart = tmp.groupby("accident_year")["outstanding_amount"].sum().reset_index(name="Value")
+
+    else:  # High Severity Features
+        tmp["is_hs"] = (tmp["incurred_amount"] >= float(sev_thresh)).astype(int)
+        chart = tmp.groupby("accident_year")["is_hs"].sum().reset_index(name="Value")
+
+    chart = chart.sort_values("accident_year")
+    st.bar_chart(chart.set_index("accident_year"))
 
 
 def render_status_summary(dff: pd.DataFrame) -> None:
@@ -262,7 +324,7 @@ def render_status_summary(dff: pd.DataFrame) -> None:
     if "feature_status" not in dff.columns:
         st.caption("No feature_status available.")
         return
-    s = dff["feature_status"].value_counts()
+
     total = int(len(dff))
     open_ct = int(dff["feature_status"].isin(list(STATUS_OPEN_SET)).sum())
     closed_ct = int((dff["feature_status"] == "CLOSED").sum())
@@ -326,7 +388,11 @@ def main() -> None:
         st.caption("Demo environment. Data generated for presentation purposes.")
 
         dff = apply_filters(df)
-        as_of = max(dff["report_date"]) if "report_date" in dff.columns and dff["report_date"].notna().any() else "Latest"
+        as_of = (
+            max(dff["report_date"])
+            if "report_date" in dff.columns and len(dff) and pd.notna(dff["report_date"]).any()
+            else "Latest"
+        )
         st.markdown(f"**As of:** {as_of}")
 
         sev_thresh = float(st.session_state["f_sev_thresh"])
@@ -339,7 +405,10 @@ def main() -> None:
         st.markdown("### Ask NARS (Prototype)")
         st.caption("Deterministic responses computed from filtered dataset.")
         qcols = st.columns([5, 1])
-        q = qcols[0].text_input("Ask a question (e.g., top 10 severe, open features, state with highest incurred)", label_visibility="collapsed")
+        q = qcols[0].text_input(
+            "Ask a question (e.g., top 10 severe, open features, state with highest incurred)",
+            label_visibility="collapsed",
+        )
         if qcols[1].button("Ask"):
             st.write(answer_question(dff, q, sev_thresh))
 
@@ -349,7 +418,7 @@ def main() -> None:
 
         # Rolodex + lower panels
         st.divider()
-        render_metric_rolodex(dff)
+        render_metric_rolodex(dff, sev_thresh)
 
         st.divider()
         left, right = st.columns([1, 1.2], gap="large")
@@ -401,6 +470,7 @@ def main() -> None:
             st.selectbox("Defense Firm", firms, key="f_defense")
 
         st.button("Reset Filters", on_click=reset_filters)
+
 
 if __name__ == "__main__":
     main()
