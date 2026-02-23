@@ -1,4 +1,3 @@
-# app.py
 from __future__ import annotations
 
 import os
@@ -238,6 +237,10 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
 
 
 def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-01", seed: int = 7) -> pd.DataFrame:
+    """
+    Demo-only helper: if the dataset doesn't have enough month history,
+    clone existing rows back to start date and add light drift so charts are not dead-flat.
+    """
     import numpy as np
 
     d = df.copy()
@@ -325,6 +328,26 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         dff = dff[dff["defense_firm"] == st.session_state["f_defense"]]
 
     return dff
+
+
+def filters_active() -> bool:
+    # If any filter differs from its "All ..." value, assume the user is filtering.
+    checks = [
+        ("f_state", "All States"),
+        ("f_acc_year", "All Years"),
+        ("f_coverage", "All Coverages"),
+        ("f_adjuster", "All Adjusters"),
+        ("f_lob", "All Lines"),
+        ("f_status", "All Statuses"),
+        ("f_cause", "All Causes"),
+        ("f_litigated", "All"),
+        ("f_vendor", "All Vendors"),
+        ("f_defense", "All Firms"),
+    ]
+    for k, default in checks:
+        if st.session_state.get(k) != default:
+            return True
+    return False
 
 
 # ============================================================
@@ -589,19 +612,218 @@ def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
+def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Mix & Distribution")
+
+    c1, c2, c3 = st.columns(3)
+
+    # Feature Status Mix (donut)
+    with c1:
+        st.caption("Feature Status Mix")
+        s = (
+            dff["feature_status"]
+            .fillna("UNKNOWN")
+            .astype(str)
+            .value_counts()
+            .reset_index()
+            .rename(columns={"index": "feature_status", "feature_status": "count"})
+        )
+        if s.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(s)
+                .mark_arc(innerRadius=55)
+                .encode(
+                    theta=alt.Theta("count:Q"),
+                    color=alt.Color("feature_status:N", legend=alt.Legend(title=None)),
+                    tooltip=["feature_status:N", "count:Q"],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # Top Coverage Types
+    with c2:
+        st.caption("Top Coverage Types")
+        cv = (
+            dff["coverage_type"]
+            .fillna("UNKNOWN")
+            .astype(str)
+            .value_counts()
+            .head(8)
+            .reset_index()
+            .rename(columns={"index": "coverage_type", "coverage_type": "count"})
+        )
+        if cv.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(cv)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title=None),
+                    y=alt.Y("coverage_type:N", sort="-x", title=None),
+                    tooltip=["coverage_type:N", "count:Q"],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # Severity Distribution (bins)
+    with c3:
+        st.caption("Severity Distribution (incurred)")
+        bins = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000]
+        labels = ["$0–50K", "$50–100K", "$100–250K", "$250–500K", "$500K–1M", "$1M–5M", "$5M+"]
+
+        v = dff["incurred_amount"].fillna(0.0)
+        # pd.cut requires len(labels) == len(bins) if include_lowest etc. We'll handle last bin separately.
+        b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
+        out = b.value_counts().sort_index().reset_index()
+        out.columns = ["bucket", "count"]
+
+        # Add a $5M+ bucket
+        over = int((v >= bins[-1]).sum())
+        if over > 0:
+            out = pd.concat(
+                [out, pd.DataFrame({"bucket": [labels[-1]], "count": [over]})],
+                ignore_index=True,
+            )
+
+        if out.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(out)
+                .mark_bar()
+                .encode(
+                    x=alt.X("bucket:N", sort=None, title=None),
+                    y=alt.Y("count:Q", title=None),
+                    tooltip=["bucket:N", "count:Q"],
+                )
+                .properties(height=240)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+
+def render_geographic_concentration(dff: pd.DataFrame) -> None:
+    st.markdown("### Geographic Concentration")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.caption("Top States by Open Features")
+        open_by_state = (
+            dff[dff["is_open_inventory"] == 1]
+            .groupby("state", dropna=False)["feature_key"]
+            .count()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+            .rename(columns={"feature_key": "open_features"})
+        )
+        open_by_state["state"] = open_by_state["state"].fillna("UNKNOWN").astype(str)
+
+        if open_by_state.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(open_by_state)
+                .mark_bar()
+                .encode(
+                    x=alt.X("open_features:Q", title=None),
+                    y=alt.Y("state:N", sort="-x", title=None),
+                    tooltip=["state:N", "open_features:Q"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    with c2:
+        st.caption("Top States by Total Incurred")
+        inc_by_state = (
+            dff.groupby("state", dropna=False)["incurred_amount"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+        )
+        inc_by_state["state"] = inc_by_state["state"].fillna("UNKNOWN").astype(str)
+
+        if inc_by_state.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(inc_by_state)
+                .mark_bar()
+                .encode(
+                    x=alt.X("incurred_amount:Q", title=None),
+                    y=alt.Y("state:N", sort="-x", title=None),
+                    tooltip=["state:N", alt.Tooltip("incurred_amount:Q", format=",.0f")],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+
+def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Metric Rolodex (Accident Year)")
+
+    metric_map = {
+        "Paid": ("paid_amount", True),
+        "Total Incurred": ("incurred_amount", True),
+        "Outstanding": ("outstanding_amount", True),
+        "Open Features": ("is_open_inventory", False),
+        "High Severity Features": ("_hs", False),
+    }
+
+    pick = st.selectbox("Metric", list(metric_map.keys()), index=0)
+
+    base = dff.copy()
+    base = base[base["accident_year"].notna()].copy()
+    base["accident_year"] = base["accident_year"].astype(int)
+
+    base["_hs"] = (base["incurred_amount"] >= sev_thresh).astype(int)
+
+    col, is_money = metric_map[pick]
+    if col == "is_open_inventory":
+        grp = base.groupby("accident_year", as_index=False).agg(value=("is_open_inventory", "sum"))
+    else:
+        grp = base.groupby("accident_year", as_index=False).agg(value=(col, "sum"))
+
+    grp = grp.sort_values("accident_year")
+    if grp.empty:
+        st.caption("No data.")
+        return
+
+    chart = (
+        alt.Chart(grp)
+        .mark_bar()
+        .encode(
+            x=alt.X("accident_year:O", title="Accident Year"),
+            y=alt.Y("value:Q", title=None),
+            tooltip=["accident_year:O", alt.Tooltip("value:Q", format=",.0f")],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 # ============================================================
 # Main
 # ============================================================
 def main() -> None:
     st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
 
+    # Sticky side columns (headlines + filters) without covering header/logo
     st.markdown(
         """
         <style>
           :root{
-            --stickyTop: 7.0rem;
+            --stickyTop: 0.75rem;
           }
 
+          /* Let sticky children behave correctly */
           div[data-testid="stHorizontalBlock"] { overflow: visible !important; }
           div[data-testid="stColumn"] { overflow: visible !important; }
 
@@ -613,11 +835,11 @@ def main() -> None:
             max-height: calc(100vh - var(--stickyTop) - 1rem);
             overflow-y: auto;
             background: white;
-            z-index: 5;
+            z-index: 2;
             padding-right: 0.25rem;
           }
 
-          .block-container { padding-top: 1.25rem; }
+          .block-container { padding-top: 1.0rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -634,8 +856,9 @@ def main() -> None:
     df_std = standardize_financials(df, strict_incurred_open_only=False)
     df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
 
-    ribbon_col, main_col, filter_col = st.columns([1.2, 3.0, 1.2], gap="large")
+    ribbon_col, main_col, filter_col = st.columns([1.25, 3.2, 1.25], gap="large")
 
+    # Filters (right sticky)
     with filter_col:
         st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
         st.markdown("### Filters")
@@ -676,22 +899,29 @@ def main() -> None:
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
+    # Headlines ribbon (left sticky)
     with ribbon_col:
         st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
         render_headlines_ribbon(dff, sev_thresh)
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # Main content
     with main_col:
-        # Header
-        hL, hM, hR = st.columns([0.35, 0.25, 0.40], vertical_alignment="center")
-
-        with hM:
+        # Newspaper-style masthead (aligned left within main content)
+        mast = st.columns([0.16, 0.84], vertical_alignment="center")
+        with mast[0]:
             logo_path = "narslogo.jpg"
             if os.path.exists(logo_path):
-                st.image(logo_path, use_container_width=True)
-
-        with hR:
-            st.markdown("## Claims Intelligence – Daily Summary")
+                st.image(logo_path, width=150)
+        with mast[1]:
+            st.markdown(
+                """
+                <div style="line-height:1.05">
+                  <div style="font-size:34px; font-weight:700;">Claims Intelligence – Daily Summary</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             as_of = "Latest"
             if dff["report_date"].notna().any():
                 as_of = str(dff["report_date"].max().date())
@@ -699,9 +929,8 @@ def main() -> None:
 
         st.divider()
 
-        # Ask NARS
+        # Ask NARS (freeform only)
         st.markdown("### Ask NARS (Prototype)")
-
         qcols = st.columns([5, 1])
         q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
         if qcols[1].button("Ask"):
@@ -720,6 +949,19 @@ def main() -> None:
         st.divider()
 
         render_high_severity_table(dff, sev_thresh)
+
+        # Restore the bottom sections you said disappeared
+        st.divider()
+
+        render_mix_and_distribution(dff, sev_thresh)
+
+        st.divider()
+
+        render_geographic_concentration(dff)
+
+        st.divider()
+
+        render_metric_rolodex_accident_year(dff, sev_thresh)
 
 
 if __name__ == "__main__":
