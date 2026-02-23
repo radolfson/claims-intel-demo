@@ -16,6 +16,17 @@ import altair as alt
 DEFAULT_SEVERITY_THRESHOLD = 250_000
 STATUS_OPEN_SET = {"OPEN", "PENDING", "REOPEN"}
 
+# Coverage mapping (demo): translate coverage_code -> true coverage name
+# Update this mapping as needed when real coverage lists are provided.
+COVERAGE_CODE_TO_COVERAGE = {
+    "AUTO-L": "BODILY INJURY",
+    "AUTO-PD": "PROPERTY DAMAGE",
+    "GL-BI": "BODILY INJURY",
+    "GL-PD": "PROPERTY DAMAGE",
+    "WC-IND": "INDEMNITY",
+    "CARGO": "CARGO",
+}
+
 
 @dataclass
 class AppConfig:
@@ -115,6 +126,13 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in ("paid_amount", "outstanding_amount", "incurred_amount"):
         d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+
+    # Normalize coverage: translate coverage_code into a human coverage label.
+    # If we can't map it, fall back to coverage_code, then existing coverage_type.
+    code = d["coverage_code"].astype("string").fillna("")
+    mapped = code.map(COVERAGE_CODE_TO_COVERAGE).astype("string")
+    d["coverage_type"] = mapped.where(mapped.notna() & (mapped != ""), d["coverage_code"]).astype("string")
+    d["coverage_type"] = d["coverage_type"].where(d["coverage_type"].notna() & (d["coverage_type"] != ""), d["coverage_type"])
 
     if "is_open_inventory" not in d.columns:
         d["is_open_inventory"] = d["feature_status"].isin(list(STATUS_OPEN_SET)).astype(int)
@@ -309,10 +327,9 @@ def init_filter_state() -> None:
         return
     st.session_state["_filters_initialized"] = True
 
-    st.session_state["f_client"] = "All Clients"
     st.session_state["f_state"] = "All States"
     st.session_state["f_acc_year"] = "All Years"
-    st.session_state["f_coverage"] = "All Coverage"
+    st.session_state["f_coverage"] = "All Coverages"
     st.session_state["f_adjuster"] = "All Adjusters"
     st.session_state["f_lob"] = "All Lines"
     st.session_state["f_status"] = "All Statuses"
@@ -321,15 +338,11 @@ def init_filter_state() -> None:
     st.session_state["f_vendor"] = "All Vendors"
     st.session_state["f_defense"] = "All Firms"
 
-    st.session_state["f_open_only"] = False
     st.session_state["f_sev_thresh"] = DEFAULT_SEVERITY_THRESHOLD
-
-    # New: rule toggles
-    st.session_state["f_strict_incurred"] = False
-    st.session_state["f_demo_synth_trends"] = True
 
 
 def reset_filters() -> None:
+
     for k in list(st.session_state.keys()):
         if k.startswith("f_") or k == "_filters_initialized":
             del st.session_state[k]
@@ -338,16 +351,13 @@ def reset_filters() -> None:
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     dff = df.copy()
 
-    if st.session_state["f_client"] != "All Clients":
-        dff = dff[dff["client"] == st.session_state["f_client"]]
-
     if st.session_state["f_state"] != "All States":
         dff = dff[dff["state"] == st.session_state["f_state"]]
 
     if st.session_state["f_acc_year"] != "All Years":
         dff = dff[dff["accident_year"] == float(st.session_state["f_acc_year"])]
 
-    if st.session_state["f_coverage"] != "All Coverage":
+    if st.session_state["f_coverage"] != "All Coverages":
         dff = dff[dff["coverage_type"] == st.session_state["f_coverage"]]
 
     if st.session_state["f_adjuster"] != "All Adjusters":
@@ -372,13 +382,31 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     if st.session_state["f_defense"] != "All Firms":
         dff = dff[dff["defense_firm"] == st.session_state["f_defense"]]
 
-    if st.session_state["f_open_only"]:
-        dff = dff[dff["is_open_inventory"] == 1]
-
     return dff
 
 
+def filters_active() -> bool:
+    """Hide headlines when any filter is not at its default selection."""
+    defaults = {
+        "f_state": "All States",
+        "f_acc_year": "All Years",
+        "f_coverage": "All Coverages",
+        "f_adjuster": "All Adjusters",
+        "f_lob": "All Lines",
+        "f_status": "All Statuses",
+        "f_cause": "All Causes",
+        "f_litigated": "All",
+        "f_vendor": "All Vendors",
+        "f_defense": "All Firms",
+    }
+    for k, v in defaults.items():
+        if st.session_state.get(k) != v:
+            return True
+    return False
+
+
 # ============================================================
+
 # KPI + MoM helpers
 # ============================================================
 def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
@@ -529,10 +557,10 @@ def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
 def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     ql = (q or "").lower().strip()
     if not ql:
-        return "Try: 'top 10 severe', 'open features', 'state with highest incurred', 'paid', 'outstanding'."
+        return "Try: 'high severity', 'open features', 'state with highest incurred', 'paid', 'outstanding'."
 
     if "top" in ql and ("severe" in ql or "severity" in ql):
-        return "Use the Top 10 Severe table below (it’s already sorted)."
+        return "Use the High Severity Features table below (already filtered by threshold)."
 
     if "open" in ql and "features" in ql:
         return f"Open inventory features: {fmt_int((dff['is_open_inventory'] == 1).sum())}."
@@ -703,46 +731,24 @@ def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
     )
 
 
-def render_tables(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Tables")
-
-    left, right = st.columns([1.0, 1.4], gap="large")
-
-    with left:
-        st.markdown("#### Feature Status Summary")
-        total = len(dff)
-        open_ct = int(dff["feature_status"].isin(list(STATUS_OPEN_SET)).sum())
-        closed_ct = int((dff["feature_status"] == "CLOSED").sum())
-        pending_ct = int((dff["feature_status"] == "PENDING").sum())
-        denied_ct = int((dff["feature_status"] == "DENIED").sum())
-
-        st.write(f"**Total Features:** {total:,}")
-        st.write(f"**Open Features:** {open_ct:,}")
-        st.write(f"**Pending Features:** {pending_ct:,}")
-        st.write(f"**Closed Features:** {closed_ct:,}")
-        st.write(f"**Denied Features:** {denied_ct:,}")
-
-        st.divider()
-        st.markdown("#### Top Open Inventory (by incurred)")
-        top_open = dff[dff["is_open_inventory"] == 1].sort_values("incurred_amount", ascending=False).head(20)
-        cols = ["feature_key", "claim_number", "state", "accident_year", "coverage_type", "feature_status", "incurred_amount", "paid_amount", "outstanding_amount", "adjuster"]
-        cols = [c for c in cols if c in top_open.columns]
-        st.dataframe(top_open[cols], use_container_width=True, hide_index=True)
-
-    with right:
-        st.markdown("#### High Severity Features (≥ threshold)")
-        top_hs = dff[dff["incurred_amount"] >= sev_thresh].sort_values("incurred_amount", ascending=False).head(50)
-        cols = ["feature_key", "claim_number", "state", "accident_year", "coverage_code", "coverage_type", "feature_status", "incurred_amount", "paid_amount", "outstanding_amount", "adjuster"]
-        cols = [c for c in cols if c in top_hs.columns]
-        st.dataframe(top_hs[cols], use_container_width=True, hide_index=True)
-
-
-def render_top10_severe(dff: pd.DataFrame) -> None:
-    st.markdown("#### Top 10 Severe (by incurred)")
-    top = dff.sort_values("incurred_amount", ascending=False).head(10)
-    cols = ["feature_key", "claim_number", "state", "accident_year", "coverage_type", "feature_status", "incurred_amount", "paid_amount", "outstanding_amount"]
-    cols = [c for c in cols if c in top.columns]
-    st.dataframe(top[cols], use_container_width=True, hide_index=True)
+def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("#### High Severity Features (≥ threshold)")
+    top_hs = dff[dff["incurred_amount"] >= sev_thresh].sort_values("incurred_amount", ascending=False).head(50)
+    cols = [
+        "feature_key",
+        "claim_number",
+        "state",
+        "accident_year",
+        "coverage_code",
+        "coverage_type",
+        "feature_status",
+        "incurred_amount",
+        "paid_amount",
+        "outstanding_amount",
+        "adjuster",
+    ]
+    cols = [c for c in cols if c in top_hs.columns]
+    st.dataframe(top_hs[cols], use_container_width=True, hide_index=True)
 
 
 # ============================================================
@@ -771,10 +777,9 @@ def main() -> None:
         st.markdown("### Filters")
 
         # Options
-        clients = ["All Clients"] + safe_list(df["client"])
         states = ["All States"] + safe_list(df["state"])
         years = ["All Years"] + [str(int(y)) for y in safe_list(df["accident_year"]) if pd.notna(y)]
-        covs = ["All Coverage"] + safe_list(df["coverage_type"])
+        covs = ["All Coverages"] + safe_list(df["coverage_type"])
         adjs = ["All Adjusters"] + safe_list(df["adjuster"])
         lobs = ["All Lines"] + safe_list(df["line_of_business"])
         statuses = ["All Statuses"] + safe_list(df["feature_status"])
@@ -782,19 +787,17 @@ def main() -> None:
         vendors = ["All Vendors"] + safe_list(df["vendor_name"])
         firms = ["All Firms"] + safe_list(df["defense_firm"])
 
-        st.selectbox("Client", clients, key="f_client")
         st.selectbox("State", states, key="f_state")
         st.selectbox("Accident Year", years, key="f_acc_year")
-        st.selectbox("Coverage Type", covs, key="f_coverage")
-        st.selectbox("Adjuster", adjs, key="f_adjuster")
+        st.selectbox("Coverage", covs, key="f_coverage")
         st.selectbox("Line of Business", lobs, key="f_lob")
+        st.selectbox("Adjuster", adjs, key="f_adjuster")
         st.selectbox("Feature Status", statuses, key="f_status")
         st.selectbox("Cause of Loss", causes, key="f_cause")
         st.selectbox("Litigation", ["All", "Litigated", "Not Litigated"], key="f_litigated")
         st.selectbox("Vendor", vendors, key="f_vendor")
         st.selectbox("Defense Firm", firms, key="f_defense")
 
-        st.checkbox("Open inventory only", key="f_open_only")
         st.number_input(
             "High severity threshold",
             min_value=50_000,
@@ -804,26 +807,29 @@ def main() -> None:
             key="f_sev_thresh",
         )
 
-        st.divider()
-        st.markdown("### Rules (demo controls)")
-        st.checkbox("Strict: non-open statuses have $0 incurred", key="f_strict_incurred")
-        st.checkbox("Demo: synthesize multi-month trends if needed", key="f_demo_synth_trends")
-
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
 
+
+
     with main_col:
-        st.title("Claims Intelligence – Daily Summary")
+        # Header with logo
+        h1, h2 = st.columns([0.12, 0.88], vertical_alignment="center")
+        logo_path = "narslogo.jpg"
+        if os.path.exists(logo_path):
+            h1.image(logo_path, use_container_width=True)
+        h2.markdown("## Claims Intelligence – Daily Summary")
         st.caption("Demo environment. Data generated for presentation purposes.")
 
         sev_thresh = float(st.session_state["f_sev_thresh"])
 
+
         # Apply financial rules early so EVERYTHING uses consistent definitions
-        df_std = standardize_financials(df, strict_incurred_open_only=bool(st.session_state["f_strict_incurred"]))
+        df_std = standardize_financials(df, strict_incurred_open_only=False)
 
         # If trend history is thin, synthesize (demo only)
         trend_months = df_std.dropna(subset=["trend_month"])["trend_month"].nunique()
-        if bool(st.session_state["f_demo_synth_trends"]) and trend_months < 2:
+        if trend_months < 2:
             df_std = synthesize_monthly_history(df_std, months_back=9, seed=7)
 
         # Now filter
@@ -844,8 +850,8 @@ def main() -> None:
 
         # Quick buttons
         b1, b2, b3, b4 = st.columns(4)
-        if b1.button("Top 10 Severe"):
-            st.session_state["_ask_answer"] = "Use the Top 10 Severe table below (already sorted)."
+        if b1.button("High Severity Features"):
+            st.session_state["_ask_answer"] = "Showing High Severity Features table below."
         if b2.button("Open Features"):
             st.session_state["_ask_answer"] = f"Open inventory features: {fmt_int((dff['is_open_inventory'] == 1).sum())}."
         if b3.button("Total Incurred"):
@@ -865,11 +871,12 @@ def main() -> None:
         if st.session_state.get("_ask_answer"):
             st.write(st.session_state["_ask_answer"])
 
-        # Always show Top 10 Severe table (matches the “executive needs” vibe)
-        render_top10_severe(dff)
+        # Show High Severity table (replaces the previous severe table)
+        render_high_severity_table(dff, sev_thresh)
 
         st.divider()
-        render_headlines(dff, sev_thresh)
+        if not filters_active():
+            render_headlines(dff, sev_thresh)
 
         st.divider()
         render_trend_section(dff, sev_thresh)
@@ -883,8 +890,6 @@ def main() -> None:
         st.divider()
         render_rolodex(dff, sev_thresh)
 
-        st.divider()
-        render_tables(dff, sev_thresh)
 
 
 if __name__ == "__main__":
