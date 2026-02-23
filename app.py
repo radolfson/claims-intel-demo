@@ -625,8 +625,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .fillna("UNKNOWN")
             .astype(str)
             .value_counts()
-            .reset_index()
-            .rename(columns={"index": "feature_status", "feature_status": "count"})
+            .reset_index(name="count")
+            .rename(columns={"index": "feature_status"})
         )
         if s.empty:
             st.caption("No data.")
@@ -652,8 +652,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .astype(str)
             .value_counts()
             .head(8)
-            .reset_index()
-            .rename(columns={"index": "coverage_type", "coverage_type": "count"})
+            .reset_index(name="count")
+            .rename(columns={"index": "coverage_type"})
         )
         if cv.empty:
             st.caption("No data.")
@@ -679,8 +679,12 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
         v = dff["incurred_amount"].fillna(0.0)
         # pd.cut requires len(labels) == len(bins) if include_lowest etc. We'll handle last bin separately.
         b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
-        out = b.value_counts().sort_index().reset_index()
-        out.columns = ["bucket", "count"]
+        out = (
+            b.value_counts()
+            .sort_index()
+            .reset_index(name="count")
+            .rename(columns={"index": "bucket"})
+        )
 
         # Add a $5M+ bucket
         over = int((v >= bins[-1]).sum())
@@ -820,7 +824,7 @@ def main() -> None:
         """
         <style>
           :root{
-            --stickyTop: 0.75rem;
+            --stickyTop: 4.25rem;
           }
 
           /* Let sticky children behave correctly */
@@ -839,7 +843,7 @@ def main() -> None:
             padding-right: 0.25rem;
           }
 
-          .block-container { padding-top: 1.0rem; }
+          .block-container { padding-top: 2.75rem; }
         </style>
         """,
         unsafe_allow_html=True,
