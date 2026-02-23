@@ -17,7 +17,6 @@ DEFAULT_SEVERITY_THRESHOLD = 250_000
 STATUS_OPEN_SET = {"OPEN", "PENDING", "REOPEN"}
 
 # Coverage mapping (demo): translate coverage_code -> true coverage name
-# Update this mapping as needed when real coverage lists are provided.
 COVERAGE_CODE_TO_COVERAGE = {
     "AUTO-L": "BODILY INJURY",
     "AUTO-PD": "PROPERTY DAMAGE",
@@ -59,16 +58,39 @@ def get_config() -> AppConfig:
 # ============================================================
 # Formatting helpers
 # ============================================================
-def fmt_currency(x) -> str:
+def fmt_int(x) -> str:
     try:
-        return f"${float(x):,.0f}"
+        return f"{int(x):,}"
     except Exception:
         return "—"
 
 
-def fmt_int(x) -> str:
+def fmt_money_compact(x) -> str:
+    """
+    Human-readable money:
+    - >= 100,000 -> $101.5K / $3.6M / $1.2B
+    - else -> $12,345
+    """
     try:
-        return f"{int(x):,}"
+        v = float(x)
+    except Exception:
+        return "—"
+
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+
+    if v >= 1_000_000_000:
+        return f"{sign}${v/1_000_000_000:.1f}B"
+    if v >= 1_000_000:
+        return f"{sign}${v/1_000_000:.1f}M"
+    if v >= 100_000:
+        return f"{sign}${v/1_000:.1f}K"
+    return f"{sign}${v:,.0f}"
+
+
+def fmt_currency_full(x) -> str:
+    try:
+        return f"${float(x):,.0f}"
     except Exception:
         return "—"
 
@@ -85,6 +107,29 @@ def pct_change(curr: float, prev: float) -> Optional[float]:
     if prev is None or prev == 0:
         return None
     return (curr - prev) / prev * 100.0
+
+
+def direction_word(delta_pct: Optional[float]) -> str:
+    if delta_pct is None:
+        return "flat"
+    if delta_pct > 0.5:
+        return "up"
+    if delta_pct < -0.5:
+        return "down"
+    return "flat"
+
+
+def strength_word(delta_pct: Optional[float]) -> str:
+    if delta_pct is None:
+        return "steady"
+    a = abs(delta_pct)
+    if a >= 10:
+        return "sharply"
+    if a >= 4:
+        return "notably"
+    if a >= 1:
+        return "slightly"
+    return "roughly"
 
 
 # ============================================================
@@ -128,7 +173,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
 
     # Normalize coverage: translate coverage_code into a human coverage label.
-    # If we can't map it, fall back to coverage_code.
     code = d["coverage_code"].astype("string").fillna("")
     mapped = code.map(COVERAGE_CODE_TO_COVERAGE).astype("string")
     d["coverage_type"] = mapped.where(mapped.notna() & (mapped != ""), d["coverage_code"]).astype("string")
@@ -241,14 +285,6 @@ def load_data(cfg: AppConfig) -> Tuple[pd.DataFrame, str]:
 # Business rules enforcement (fast, demo-safe, defensible)
 # ============================================================
 def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) -> pd.DataFrame:
-    """
-    Enforce demo rules so KPIs/tables are consistent even if source data is messy.
-    Rules:
-      - DENIED: paid/outstanding/incurred = 0
-      - CLOSED: outstanding = 0, incurred = paid
-      - Otherwise: incurred = max(incurred, paid + outstanding)
-      - Optional strict: if status not in OPEN/PENDING/REOPEN then incurred = 0
-    """
     d = df.copy()
     status = d["feature_status"].fillna("UNKNOWN").astype(str)
 
@@ -277,9 +313,10 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
     return d
 
 
-def synthesize_monthly_history(df: pd.DataFrame, months_back: int = 9, seed: int = 7) -> pd.DataFrame:
+def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-01", seed: int = 7) -> pd.DataFrame:
     """
-    Demo-only helper: if you only have 1 month, create plausible multi-month history.
+    Demo-only: create plausible multi-month history back to `start`.
+    If you already have multiple months, it just returns df as-is.
     """
     import numpy as np
 
@@ -288,8 +325,13 @@ def synthesize_monthly_history(df: pd.DataFrame, months_back: int = 9, seed: int
     if d.empty:
         return df
 
+    # If already goes back to start, do nothing
+    start_dt = pd.to_datetime(start)
+    if d["trend_month"].min() <= start_dt:
+        return df
+
     cur_month = d["trend_month"].max()
-    months = pd.date_range(end=cur_month, periods=months_back + 1, freq="MS")
+    months = pd.date_range(start=start_dt, end=cur_month, freq="MS")
 
     rng = np.random.default_rng(seed)
 
@@ -298,6 +340,7 @@ def synthesize_monthly_history(df: pd.DataFrame, months_back: int = 9, seed: int
         f = d.copy()
         f["trend_month"] = m
 
+        # Add gentle drift so lines aren't perfectly flat
         drift = 1.0 + rng.normal(0.0, 0.06, size=len(f))
         drift = np.clip(drift, 0.80, 1.25)
 
@@ -378,7 +421,7 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# KPI + MoM helpers
+# KPI + Trends helpers
 # ============================================================
 def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
     open_features = int((dff["is_open_inventory"] == 1).sum())
@@ -387,6 +430,9 @@ def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
     outstanding = float(dff["outstanding_amount"].sum())
     high_sev = int((dff["incurred_amount"] >= sev_thresh).sum())
     total_features = int(len(dff))
+
+    reserve_ratio = (outstanding / total_incurred * 100.0) if total_incurred else 0.0
+
     return dict(
         open_features=open_features,
         total_features=total_features,
@@ -394,6 +440,7 @@ def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
         paid=paid,
         outstanding=outstanding,
         high_sev=high_sev,
+        reserve_ratio=reserve_ratio,
     )
 
 
@@ -409,6 +456,7 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
                 "outstanding",
                 "high_sev",
                 "total_features",
+                "reserve_ratio",
             ]
         )
 
@@ -424,6 +472,10 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
             high_sev=("is_hs", "sum"),
         )
         .sort_values("trend_month")
+    )
+    roll["reserve_ratio"] = roll.apply(
+        lambda r: (r["outstanding"] / r["total_incurred"] * 100.0) if r["total_incurred"] else 0.0,
+        axis=1,
     )
     return roll
 
@@ -490,55 +542,91 @@ def bar_chart(df: pd.DataFrame, x: str, y: str, title: str, horizontal: bool = F
 
 
 # ============================================================
-# Narrative (Headlines ribbon)
+# Narrative (nuanced headlines)
 # ============================================================
-def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
+def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
+    """
+    Produces 4 "news-style" bullets.
+    It's intentionally interpretive. The point is to show what the *future* LLM
+    will do, not to pretend these are actuarial truth tablets.
+    """
     k = calc_kpis(dff, sev_thresh)
-    open_ct = k["open_features"]
-    total_ct = k["total_features"]
-    open_pct = (open_ct / total_ct * 100) if total_ct else 0.0
+    roll = monthly_rollup(dff, sev_thresh)
 
-    hs_ct = k["high_sev"]
-    hs_pct = (hs_ct / open_ct * 100) if open_ct else 0.0
+    # If we have at least 2 months, derive deltas; otherwise keep it descriptive.
+    open_curr, open_prev = last_two_months(roll, "open_features")
+    inc_curr, inc_prev = last_two_months(roll, "total_incurred")
+    hs_curr, hs_prev = last_two_months(roll, "high_sev")
+    rr_curr, rr_prev = last_two_months(roll, "reserve_ratio")
 
-    total_incurred = k["total_incurred"]
-    total_out = k["outstanding"]
-    out_pct = (total_out / total_incurred * 100) if total_incurred else 0.0
+    open_delta = pct_change(open_curr or 0, open_prev or 0) if open_prev is not None else None
+    inc_delta = pct_change(inc_curr or 0, inc_prev or 0) if inc_prev is not None else None
+    hs_delta = pct_change(hs_curr or 0, hs_prev or 0) if hs_prev is not None else None
+    rr_delta = pct_change(rr_curr or 0, rr_prev or 0) if rr_prev is not None else None
 
-    year_msg = f"Open features total {open_ct:,} (~{open_pct:.1f}% of filtered inventory)."
-    if total_ct and dff["accident_year"].notna().any():
+    # Geographic + year concentration
+    year_line = "Claim volume looks broadly distributed across accident years."
+    if k["total_features"] and dff["accident_year"].notna().any():
         ay = dff.groupby("accident_year").size().sort_values(ascending=False)
         top_years = ay.index[:2].tolist()
         if len(top_years) >= 2:
-            top_share = ay.iloc[:2].sum() / total_ct * 100
-            year_msg = (
-                f"Open features total {open_ct:,}, concentrated in accident years "
-                f"{int(top_years[0])}–{int(top_years[1])} (~{top_share:.1f}% of inventory)."
-            )
-        elif len(top_years) == 1:
-            year_msg = f"Open features total {open_ct:,}, concentrated in accident year {int(top_years[0])} (filtered selection)."
+            share = ay.iloc[:2].sum() / k["total_features"] * 100
+            year_line = f"Inventory is concentrated in accident years {int(top_years[0])}–{int(top_years[1])} (~{share:.1f}% of the selection)."
 
-    state_msg = "Geographic concentration not available for current filters."
-    if total_ct and dff["state"].notna().any():
+    state_line = "No single state dominates this selection."
+    if k["total_features"] and dff["state"].notna().any():
         stc = dff.groupby("state").size().sort_values(ascending=False)
         top_states = stc.index[:2].tolist()
         if len(top_states) >= 2:
-            st_share = stc.iloc[:2].sum() / total_ct * 100
-            state_msg = f"{top_states[0]} and {top_states[1]} account for ~{st_share:.1f}% of feature count."
+            share = stc.iloc[:2].sum() / k["total_features"] * 100
+            state_line = f"{top_states[0]} and {top_states[1]} make up ~{share:.1f}% of features, suggesting regional concentration risk."
         elif len(top_states) == 1:
-            state_msg = f"{top_states[0]} accounts for 100% of feature count (filtered selection)."
+            state_line = f"{top_states[0]} represents 100% of the current selection (filter-driven concentration)."
 
+    # Build "news" interpretations
+    open_dir = direction_word(open_delta)
+    open_strength = strength_word(open_delta)
+    inc_dir = direction_word(inc_delta)
+    inc_strength = strength_word(inc_delta)
+    rr_dir = direction_word(rr_delta)
+
+    # These are intentionally plausible, not definitive.
+    story_1 = (
+        f"Open inventory is {open_strength} {open_dir}. "
+        f"If this persists, it can signal slower claim resolution, fresh reporting inflow, or operational capacity constraints "
+        f"(adjuster staffing, intake surges, or litigation drag)."
+    )
+
+    story_2 = (
+        f"Total incurred is {inc_strength} {inc_dir}. "
+        f"When incurred rises faster than open count, severity is usually the driver; when it rises with open count, volume is the story. "
+        f"Either way, it’s an early budget signal."
+    )
+
+    story_3 = (
+        f"Reserve posture is {rr_dir} with outstanding at {fmt_money_compact(k['outstanding'])} "
+        f"({k['reserve_ratio']:.1f}% of incurred). "
+        f"A rising reserve ratio often reflects cautious case reserving or developing claim complexity; "
+        f"a falling ratio can reflect settlements closing out or paid catching up."
+    )
+
+    story_4 = (
+        f"High severity exposure is {fmt_int(k['high_sev'])} features at ≥ {fmt_money_compact(sev_thresh)}. "
+        f"Watch for clustering by coverage and state. {state_line} {year_line}"
+    )
+
+    return [story_1, story_2, story_3, story_4]
+
+
+def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Today’s Headlines")
-    st.info(year_msg)
-    st.success(
-        f"High severity features represent {hs_pct:.1f}% of open inventory "
-        f"({hs_ct:,} features at ≥ {fmt_currency(sev_thresh)})."
-    )
-    st.warning(
-        f"Total incurred stands at {fmt_currency(total_incurred)} with "
-        f"{fmt_currency(total_out)} outstanding ({out_pct:.1f}% case reserves)."
-    )
-    st.info(state_msg)
+
+    bullets = build_headline_story(dff, sev_thresh)
+    # Styled like the “ribbon” tiles you already like
+    st.info(bullets[0])
+    st.success(bullets[1])
+    st.warning(bullets[2])
+    st.info(bullets[3])
 
 
 # ============================================================
@@ -558,17 +646,17 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
         by_state = dff.groupby("state")["incurred_amount"].sum().sort_values(ascending=False)
         if by_state.empty:
             return "No state data in this selection."
-        return f"State with highest incurred: {by_state.index[0]} ({fmt_currency(by_state.iloc[0])})."
+        return f"State with highest incurred: {by_state.index[0]} ({fmt_money_compact(by_state.iloc[0])})."
 
     if "paid" in ql:
-        return f"Total paid: {fmt_currency(dff['paid_amount'].sum())}."
+        return f"Total paid: {fmt_money_compact(dff['paid_amount'].sum())}."
 
     if "outstanding" in ql or "reserve" in ql:
-        return f"Total outstanding: {fmt_currency(dff['outstanding_amount'].sum())}."
+        return f"Total outstanding: {fmt_money_compact(dff['outstanding_amount'].sum())}."
 
     if "high severity" in ql or "threshold" in ql or ">=" in ql or "severe" in ql:
         hs = int((dff["incurred_amount"] >= sev_thresh).sum())
-        return f"High severity features (≥ {fmt_currency(sev_thresh)}): {hs:,}."
+        return f"High severity features (≥ {fmt_money_compact(sev_thresh)}): {hs:,}."
 
     return "Try: 'open features', 'state with highest incurred', 'paid', 'outstanding', 'high severity'."
 
@@ -578,24 +666,28 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 # ============================================================
 def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
     k = calc_kpis(dff, sev_thresh)
+
+    st.markdown("### Key Metrics")
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
-    c2.metric("Total Incurred", fmt_currency(k["total_incurred"]))
-    c3.metric("Paid", fmt_currency(k["paid"]))
-    c4.metric("Outstanding", fmt_currency(k["outstanding"]))
+    c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
+    c3.metric("Paid", fmt_money_compact(k["paid"]))
+    c4.metric("Outstanding", fmt_money_compact(k["outstanding"]))
     c5.metric("High Severity Features", fmt_int(k["high_sev"]))
 
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Trends (Month over Month)")
+    st.markdown("### Trends")
 
     roll = monthly_rollup(dff, sev_thresh)
 
     if roll.empty or roll["trend_month"].nunique() < 2:
-        st.caption("Not enough monthly history to show MoM trends (need 2+ months).")
+        st.caption("Not enough monthly history to show trends (need 2+ months).")
         return
 
-    roll = roll.sort_values("trend_month").tail(12)
+    # User requested back to 2021: show all months we have (after synth)
+    roll = roll.sort_values("trend_month")
 
     metrics = [
         ("open_features", "Open Features", False),
@@ -609,11 +701,11 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     for idx, (col, label, is_money) in enumerate(metrics):
         curr, prev = last_two_months(roll, col)
         delta = pct_change(curr or 0, prev or 0) if prev is not None else None
-        stat_cols[idx].metric(
-            label,
-            fmt_currency(curr) if is_money else fmt_int(curr),
-            None if delta is None else f"{delta:+.1f}%",
-        )
+
+        display_val = fmt_money_compact(curr) if is_money else fmt_int(curr)
+        display_delta = None if delta is None else f"{delta:+.1f}%"
+
+        stat_cols[idx].metric(label, display_val, display_delta)
 
     st.divider()
 
@@ -638,11 +730,13 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
 
 def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Top 10 High Severity Claims (≥ threshold)")
+
     top_hs = (
         dff[dff["incurred_amount"] >= sev_thresh]
         .sort_values("incurred_amount", ascending=False)
         .head(10)
     )
+
     cols = [
         "feature_key",
         "claim_number",
@@ -657,7 +751,13 @@ def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
         "adjuster",
     ]
     cols = [c for c in cols if c in top_hs.columns]
-    st.dataframe(top_hs[cols], use_container_width=True, hide_index=True)
+
+    disp = top_hs[cols].copy()
+    for money_col in ("incurred_amount", "paid_amount", "outstanding_amount"):
+        if money_col in disp.columns:
+            disp[money_col] = disp[money_col].apply(fmt_money_compact)
+
+    st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
 def render_mix_distribution(dff: pd.DataFrame) -> None:
@@ -777,6 +877,26 @@ def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
 # ============================================================
 def main() -> None:
     st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
+
+    # Sticky side columns (ribbon + filters)
+    st.markdown(
+        """
+        <style>
+          /* make our wrapper sticky and scrollable */
+          .sticky-col {
+            position: sticky;
+            top: 0.75rem;
+            max-height: calc(100vh - 1.5rem);
+            overflow-y: auto;
+            padding-right: 0.25rem;
+          }
+          /* slightly tighten page padding so sticky feels clean */
+          .block-container { padding-top: 1.25rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     cfg = get_config()
     init_filter_state()
 
@@ -791,13 +911,14 @@ def main() -> None:
         st.error("Dataset loaded but returned 0 rows.")
         st.stop()
 
-    # NEW LAYOUT:
-    # Left = Headlines ribbon
+    # Layout:
+    # Left = Headlines ribbon (sticky)
     # Center = Main content
-    # Right = Filters
+    # Right = Filters (sticky)
     ribbon_col, main_col, filter_col = st.columns([1.2, 3.0, 1.2], gap="large")
 
     with filter_col:
+        st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
         st.markdown("### Filters")
 
         states = ["All States"] + safe_list(df["state"])
@@ -821,7 +942,6 @@ def main() -> None:
         st.selectbox("Vendor", vendors, key="f_vendor")
         st.selectbox("Defense Firm", firms, key="f_defense")
 
-        # IMPORTANT: no value=... when using key, prevents the yellow warning
         st.number_input(
             "High severity threshold",
             min_value=50_000,
@@ -832,21 +952,22 @@ def main() -> None:
 
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # Apply rules early so everything uses consistent definitions
+    # Standardize first
     df_std = standardize_financials(df, strict_incurred_open_only=False)
 
-    # If trend history is thin, synthesize (demo only)
-    trend_months = df_std.dropna(subset=["trend_month"])["trend_month"].nunique()
-    if trend_months < 2:
-        df_std = synthesize_monthly_history(df_std, months_back=9, seed=7)
+    # Ensure we have monthly trends back to 2021 (demo synth)
+    df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
 
     # Filtered dataset used for BOTH ribbon and main
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
     with ribbon_col:
+        st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
         render_headlines_ribbon(dff, sev_thresh)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with main_col:
         # Header with logo
@@ -865,7 +986,7 @@ def main() -> None:
 
         st.divider()
 
-        # Ask NARS moved ABOVE KPIs + ribbon area (ribbon already left)
+        # Ask NARS (freeform)
         st.markdown("### Ask NARS (Prototype)")
         st.caption("Deterministic responses computed from the filtered dataset.")
 
@@ -879,17 +1000,17 @@ def main() -> None:
 
         st.divider()
 
-        # KPIs back to horizontal row
+        # KPIs with headline above (and compact money)
         render_kpi_row(dff, sev_thresh)
 
         st.divider()
 
-        # Trends
+        # Trends (renamed)
         render_trend_section(dff, sev_thresh)
 
         st.divider()
 
-        # High Severity table directly below trends (stays)
+        # High Severity table directly below trends
         render_high_severity_table(dff, sev_thresh)
 
         st.divider()
