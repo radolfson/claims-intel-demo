@@ -5,9 +5,9 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import altair as alt
 import pandas as pd
 import streamlit as st
-import altair as alt
 
 
 # ============================================================
@@ -321,18 +321,17 @@ def init_filter_state() -> None:
         return
     st.session_state["_filters_initialized"] = True
 
-    st.session_state["f_state"] = "All States"
-    st.session_state["f_acc_year"] = "All Years"
-    st.session_state["f_coverage"] = "All Coverages"
-    st.session_state["f_adjuster"] = "All Adjusters"
-    st.session_state["f_lob"] = "All Lines"
-    st.session_state["f_status"] = "All Statuses"
-    st.session_state["f_cause"] = "All Causes"
-    st.session_state["f_litigated"] = "All"
-    st.session_state["f_vendor"] = "All Vendors"
-    st.session_state["f_defense"] = "All Firms"
-
-    st.session_state["f_sev_thresh"] = DEFAULT_SEVERITY_THRESHOLD
+    st.session_state.setdefault("f_state", "All States")
+    st.session_state.setdefault("f_acc_year", "All Years")
+    st.session_state.setdefault("f_coverage", "All Coverages")
+    st.session_state.setdefault("f_adjuster", "All Adjusters")
+    st.session_state.setdefault("f_lob", "All Lines")
+    st.session_state.setdefault("f_status", "All Statuses")
+    st.session_state.setdefault("f_cause", "All Causes")
+    st.session_state.setdefault("f_litigated", "All")
+    st.session_state.setdefault("f_vendor", "All Vendors")
+    st.session_state.setdefault("f_defense", "All Firms")
+    st.session_state.setdefault("f_sev_thresh", DEFAULT_SEVERITY_THRESHOLD)
 
 
 def reset_filters() -> None:
@@ -376,26 +375,6 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         dff = dff[dff["defense_firm"] == st.session_state["f_defense"]]
 
     return dff
-
-
-def filters_active() -> bool:
-    """Hide headlines when any filter is not at its default selection."""
-    defaults = {
-        "f_state": "All States",
-        "f_acc_year": "All Years",
-        "f_coverage": "All Coverages",
-        "f_adjuster": "All Adjusters",
-        "f_lob": "All Lines",
-        "f_status": "All Statuses",
-        "f_cause": "All Causes",
-        "f_litigated": "All",
-        "f_vendor": "All Vendors",
-        "f_defense": "All Firms",
-    }
-    for k, v in defaults.items():
-        if st.session_state.get(k) != v:
-            return True
-    return False
 
 
 # ============================================================
@@ -511,9 +490,9 @@ def bar_chart(df: pd.DataFrame, x: str, y: str, title: str, horizontal: bool = F
 
 
 # ============================================================
-# Narrative (safe)
+# Narrative (Headlines ribbon)
 # ============================================================
-def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
+def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
     k = calc_kpis(dff, sev_thresh)
     open_ct = k["open_features"]
     total_ct = k["total_features"]
@@ -563,15 +542,12 @@ def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
 
 
 # ============================================================
-# Ask NARS (prototype deterministic)
+# Ask NARS (prototype deterministic) - freeform only
 # ============================================================
 def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     ql = (q or "").lower().strip()
     if not ql:
-        return "Try: 'high severity', 'open features', 'state with highest incurred', 'paid', 'outstanding'."
-
-    if "top" in ql and ("severe" in ql or "severity" in ql):
-        return "Use the High Severity Features table below (already filtered by threshold)."
+        return "Ask something like: 'open features', 'state with highest incurred', 'paid', 'outstanding', 'high severity'."
 
     if "open" in ql and "features" in ql:
         return f"Open inventory features: {fmt_int((dff['is_open_inventory'] == 1).sum())}."
@@ -590,37 +566,24 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     if "outstanding" in ql or "reserve" in ql:
         return f"Total outstanding: {fmt_currency(dff['outstanding_amount'].sum())}."
 
-    if "high severity" in ql or "threshold" in ql or ">=" in ql:
+    if "high severity" in ql or "threshold" in ql or ">=" in ql or "severe" in ql:
         hs = int((dff["incurred_amount"] >= sev_thresh).sum())
         return f"High severity features (≥ {fmt_currency(sev_thresh)}): {hs:,}."
 
-    return "Try: 'open features', 'state with highest incurred', 'paid', 'outstanding'."
+    return "Try: 'open features', 'state with highest incurred', 'paid', 'outstanding', 'high severity'."
 
 
 # ============================================================
 # UI Sections
 # ============================================================
-def render_kpis_and_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
-    """
-    Left: vertical KPI stack
-    Right: headlines (only when filters are NOT active)
-    """
+def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
     k = calc_kpis(dff, sev_thresh)
-
-    left, right = st.columns([1, 2], gap="large")
-
-    with left:
-        st.metric("Open Features", fmt_int(k["open_features"]))
-        st.metric("Total Incurred", fmt_currency(k["total_incurred"]))
-        st.metric("Paid", fmt_currency(k["paid"]))
-        st.metric("Outstanding", fmt_currency(k["outstanding"]))
-        st.metric("High Severity Features", fmt_int(k["high_sev"]))
-
-    with right:
-        if not filters_active():
-            render_headlines(dff, sev_thresh)
-        else:
-            st.caption("Headlines hidden while filters are active.")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Open Features", fmt_int(k["open_features"]))
+    c2.metric("Total Incurred", fmt_currency(k["total_incurred"]))
+    c3.metric("Paid", fmt_currency(k["paid"]))
+    c4.metric("Outstanding", fmt_currency(k["outstanding"]))
+    c5.metric("High Severity Features", fmt_int(k["high_sev"]))
 
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
@@ -671,6 +634,30 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
                 line_chart(roll, "trend_month:T", f"{metric_col}:Q", title),
                 use_container_width=True,
             )
+
+
+def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Top 10 High Severity Claims (≥ threshold)")
+    top_hs = (
+        dff[dff["incurred_amount"] >= sev_thresh]
+        .sort_values("incurred_amount", ascending=False)
+        .head(10)
+    )
+    cols = [
+        "feature_key",
+        "claim_number",
+        "state",
+        "accident_year",
+        "coverage_code",
+        "coverage_type",
+        "feature_status",
+        "incurred_amount",
+        "paid_amount",
+        "outstanding_amount",
+        "adjuster",
+    ]
+    cols = [c for c in cols if c in top_hs.columns]
+    st.dataframe(top_hs[cols], use_container_width=True, hide_index=True)
 
 
 def render_mix_distribution(dff: pd.DataFrame) -> None:
@@ -785,30 +772,6 @@ def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
     )
 
 
-def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Top 10 High Severity Claims (≥ threshold)")
-    top_hs = (
-        dff[dff["incurred_amount"] >= sev_thresh]
-        .sort_values("incurred_amount", ascending=False)
-        .head(10)
-    )
-    cols = [
-        "feature_key",
-        "claim_number",
-        "state",
-        "accident_year",
-        "coverage_code",
-        "coverage_type",
-        "feature_status",
-        "incurred_amount",
-        "paid_amount",
-        "outstanding_amount",
-        "adjuster",
-    ]
-    cols = [c for c in cols if c in top_hs.columns]
-    st.dataframe(top_hs[cols], use_container_width=True, hide_index=True)
-
-
 # ============================================================
 # Main
 # ============================================================
@@ -828,8 +791,11 @@ def main() -> None:
         st.error("Dataset loaded but returned 0 rows.")
         st.stop()
 
-    # Layout: main + right filter panel
-    main_col, filter_col = st.columns([3.2, 1.2], gap="large")
+    # NEW LAYOUT:
+    # Left = Headlines ribbon
+    # Center = Main content
+    # Right = Filters
+    ribbon_col, main_col, filter_col = st.columns([1.2, 3.0, 1.2], gap="large")
 
     with filter_col:
         st.markdown("### Filters")
@@ -855,17 +821,32 @@ def main() -> None:
         st.selectbox("Vendor", vendors, key="f_vendor")
         st.selectbox("Defense Firm", firms, key="f_defense")
 
+        # IMPORTANT: no value=... when using key, prevents the yellow warning
         st.number_input(
             "High severity threshold",
             min_value=50_000,
             max_value=2_000_000,
             step=25_000,
-            value=int(st.session_state["f_sev_thresh"]),
             key="f_sev_thresh",
         )
 
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
+
+    # Apply rules early so everything uses consistent definitions
+    df_std = standardize_financials(df, strict_incurred_open_only=False)
+
+    # If trend history is thin, synthesize (demo only)
+    trend_months = df_std.dropna(subset=["trend_month"])["trend_month"].nunique()
+    if trend_months < 2:
+        df_std = synthesize_monthly_history(df_std, months_back=9, seed=7)
+
+    # Filtered dataset used for BOTH ribbon and main
+    dff = apply_filters(df_std)
+    sev_thresh = float(st.session_state["f_sev_thresh"])
+
+    with ribbon_col:
+        render_headlines_ribbon(dff, sev_thresh)
 
     with main_col:
         # Header with logo
@@ -876,19 +857,6 @@ def main() -> None:
         h2.markdown("## Claims Intelligence – Daily Summary")
         st.caption("Demo environment. Data generated for presentation purposes.")
 
-        sev_thresh = float(st.session_state["f_sev_thresh"])
-
-        # Apply financial rules early so EVERYTHING uses consistent definitions
-        df_std = standardize_financials(df, strict_incurred_open_only=False)
-
-        # If trend history is thin, synthesize (demo only)
-        trend_months = df_std.dropna(subset=["trend_month"])["trend_month"].nunique()
-        if trend_months < 2:
-            df_std = synthesize_monthly_history(df_std, months_back=9, seed=7)
-
-        # Now filter
-        dff = apply_filters(df_std)
-
         # As-of
         as_of = "Latest"
         if dff["report_date"].notna().any():
@@ -897,28 +865,9 @@ def main() -> None:
 
         st.divider()
 
-        # NEW: KPI stack (left) + Headlines (right)
-        render_kpis_and_headlines(dff, sev_thresh)
-
-        st.divider()
-
-        # Ask NARS (kept)
+        # Ask NARS moved ABOVE KPIs + ribbon area (ribbon already left)
         st.markdown("### Ask NARS (Prototype)")
         st.caption("Deterministic responses computed from the filtered dataset.")
-
-        b1, b2, b3, b4 = st.columns(4)
-        if b1.button("High Severity Features"):
-            st.session_state["_ask_answer"] = "High Severity table is shown below Trends."
-        if b2.button("Open Features"):
-            st.session_state["_ask_answer"] = f"Open inventory features: {fmt_int((dff['is_open_inventory'] == 1).sum())}."
-        if b3.button("Total Incurred"):
-            st.session_state["_ask_answer"] = f"Total incurred: {fmt_currency(dff['incurred_amount'].sum())}."
-        if b4.button("State w/ Highest Incurred"):
-            if dff["state"].isna().all():
-                st.session_state["_ask_answer"] = "No state data in this selection."
-            else:
-                by_state = dff.groupby("state")["incurred_amount"].sum().sort_values(ascending=False)
-                st.session_state["_ask_answer"] = f"State with highest incurred: {by_state.index[0]} ({fmt_currency(by_state.iloc[0])})."
 
         qcols = st.columns([5, 1])
         q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
@@ -930,12 +879,17 @@ def main() -> None:
 
         st.divider()
 
+        # KPIs back to horizontal row
+        render_kpi_row(dff, sev_thresh)
+
+        st.divider()
+
         # Trends
         render_trend_section(dff, sev_thresh)
 
         st.divider()
 
-        # NEW: High Severity table directly below trends
+        # High Severity table directly below trends (stays)
         render_high_severity_table(dff, sev_thresh)
 
         st.divider()
