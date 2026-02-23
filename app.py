@@ -165,7 +165,6 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     for col in ("paid_amount", "outstanding_amount", "incurred_amount"):
         d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
 
-    # Normalize coverage: translate coverage_code into a human coverage label.
     code = d["coverage_code"].astype("string").fillna("")
     mapped = code.map(COVERAGE_CODE_TO_COVERAGE).astype("string")
     d["coverage_type"] = mapped.where(mapped.notna() & (mapped != ""), d["coverage_code"]).astype("string")
@@ -201,75 +200,7 @@ def load_from_csv(path: str) -> pd.DataFrame:
     return normalize_df(df)
 
 
-@st.cache_data(show_spinner=False)
-def load_from_snowflake(detail_view: str) -> pd.DataFrame:
-    try:
-        import snowflake.connector  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Snowflake connector not installed. Add snowflake-connector-python to requirements.txt."
-        ) from e
-
-    account = st.secrets.get("SNOWFLAKE_ACCOUNT")
-    user = st.secrets.get("SNOWFLAKE_USER")
-    warehouse = st.secrets.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH")
-    database = st.secrets.get("SNOWFLAKE_DATABASE", "NARS")
-    schema = st.secrets.get("SNOWFLAKE_SCHEMA", "PROCESSED")
-
-    private_key_pem = str(st.secrets.get("SNOWFLAKE_PRIVATE_KEY", "")).strip()
-    password = st.secrets.get("SNOWFLAKE_PASSWORD", None)
-
-    if not account or not user:
-        raise RuntimeError("Missing SNOWFLAKE_ACCOUNT or SNOWFLAKE_USER in Streamlit secrets.")
-
-    connect_kwargs = dict(
-        account=account,
-        user=user,
-        warehouse=warehouse,
-        database=database,
-        schema=schema,
-    )
-
-    if private_key_pem:
-        try:
-            from cryptography.hazmat.primitives import serialization  # type: ignore
-            from cryptography.hazmat.backends import default_backend  # type: ignore
-
-            pkey = serialization.load_pem_private_key(
-                private_key_pem.encode("utf-8"),
-                password=None,
-                backend=default_backend(),
-            )
-            connect_kwargs["private_key"] = pkey
-        except Exception as e:
-            raise RuntimeError("Failed to parse SNOWFLAKE_PRIVATE_KEY (PEM).") from e
-    elif password:
-        connect_kwargs["password"] = password
-    else:
-        raise RuntimeError("Provide SNOWFLAKE_PRIVATE_KEY or SNOWFLAKE_PASSWORD in secrets.")
-
-    sql = f"SELECT * FROM {detail_view}"
-
-    ctx = snowflake.connector.connect(**connect_kwargs)
-    try:
-        cur = ctx.cursor()
-        try:
-            cur.execute(sql)
-            df = cur.fetch_pandas_all()
-        finally:
-            cur.close()
-    finally:
-        ctx.close()
-
-    return normalize_df(df)
-
-
 def load_data(cfg: AppConfig) -> Tuple[pd.DataFrame, str]:
-    if cfg.data_source == "snowflake":
-        if not cfg.sf_detail_view:
-            raise RuntimeError("DATA_SOURCE=snowflake but SF_DETAIL_VIEW is not set in secrets.")
-        df = load_from_snowflake(cfg.sf_detail_view)
-        return df, "snowflake"
     df = load_from_csv(cfg.data_file)
     return df, "csv"
 
@@ -307,10 +238,6 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
 
 
 def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-01", seed: int = 7) -> pd.DataFrame:
-    """
-    Demo-only: create plausible monthly history back to `start` if the source
-    doesn't already go back that far.
-    """
     import numpy as np
 
     d = df.copy()
@@ -377,32 +304,23 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 
     if st.session_state["f_state"] != "All States":
         dff = dff[dff["state"] == st.session_state["f_state"]]
-
     if st.session_state["f_acc_year"] != "All Years":
         dff = dff[dff["accident_year"] == float(st.session_state["f_acc_year"])]
-
     if st.session_state["f_coverage"] != "All Coverages":
         dff = dff[dff["coverage_type"] == st.session_state["f_coverage"]]
-
     if st.session_state["f_adjuster"] != "All Adjusters":
         dff = dff[dff["adjuster"] == st.session_state["f_adjuster"]]
-
     if st.session_state["f_lob"] != "All Lines":
         dff = dff[dff["line_of_business"] == st.session_state["f_lob"]]
-
     if st.session_state["f_status"] != "All Statuses":
         dff = dff[dff["feature_status"] == st.session_state["f_status"]]
-
     if st.session_state["f_cause"] != "All Causes":
         dff = dff[dff["cause_of_loss"] == st.session_state["f_cause"]]
-
     if st.session_state["f_litigated"] != "All":
         want = 1 if st.session_state["f_litigated"] == "Litigated" else 0
         dff = dff[dff["is_litigated"] == want]
-
     if st.session_state["f_vendor"] != "All Vendors":
         dff = dff[dff["vendor_name"] == st.session_state["f_vendor"]]
-
     if st.session_state["f_defense"] != "All Firms":
         dff = dff[dff["defense_firm"] == st.session_state["f_defense"]]
 
@@ -438,7 +356,6 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
         return pd.DataFrame(columns=["trend_month"])
 
     m["is_hs"] = (m["incurred_amount"] >= sev_thresh).astype(int)
-
     roll = (
         m.groupby("trend_month", as_index=False)
         .agg(
@@ -467,60 +384,7 @@ def last_two_months(roll: pd.DataFrame, metric: str) -> Tuple[Optional[float], O
 
 
 # ============================================================
-# Charts (Altair)
-# ============================================================
-def line_chart(df: pd.DataFrame, x: str, y: str, title: str) -> alt.Chart:
-    return (
-        alt.Chart(df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X(x, title="Month"),
-            y=alt.Y(y, title=None),
-            tooltip=[x, y],
-        )
-        .properties(title=title, height=220)
-    )
-
-
-def donut_chart(df: pd.DataFrame, category: str, value: str, title: str) -> alt.Chart:
-    return (
-        alt.Chart(df)
-        .mark_arc(innerRadius=60)
-        .encode(
-            theta=alt.Theta(field=value, type="quantitative"),
-            color=alt.Color(field=category, type="nominal"),
-            tooltip=[category, value],
-        )
-        .properties(title=title, height=260)
-    )
-
-
-def bar_chart(df: pd.DataFrame, x: str, y: str, title: str, horizontal: bool = False) -> alt.Chart:
-    if horizontal:
-        return (
-            alt.Chart(df)
-            .mark_bar()
-            .encode(
-                y=alt.Y(x, sort="-x", title=None),
-                x=alt.X(y, title=None),
-                tooltip=[x, y],
-            )
-            .properties(title=title, height=260)
-        )
-    return (
-        alt.Chart(df)
-        .mark_bar()
-        .encode(
-            x=alt.X(x, sort="-y", title=None),
-            y=alt.Y(y, title=None),
-            tooltip=[x, y],
-        )
-        .properties(title=title, height=260)
-    )
-
-
-# ============================================================
-# Narrative (nuanced headlines)
+# Narrative
 # ============================================================
 def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
     k = calc_kpis(dff, sev_thresh)
@@ -528,12 +392,10 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
 
     open_curr, open_prev = last_two_months(roll, "open_features")
     inc_curr, inc_prev = last_two_months(roll, "total_incurred")
-    hs_curr, hs_prev = last_two_months(roll, "high_sev")
     rr_curr, rr_prev = last_two_months(roll, "reserve_ratio")
 
     open_delta = pct_change(open_curr or 0, open_prev or 0) if open_prev is not None else None
     inc_delta = pct_change(inc_curr or 0, inc_prev or 0) if inc_prev is not None else None
-    hs_delta = pct_change(hs_curr or 0, hs_prev or 0) if hs_prev is not None else None
     rr_delta = pct_change(rr_curr or 0, rr_prev or 0) if rr_prev is not None else None
 
     year_line = "Claim volume looks broadly distributed across accident years."
@@ -582,9 +444,6 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
         f"Watch for clustering by coverage and state. {state_line} {year_line}"
     )
 
-    # We’re not using hs_delta yet, but keeping it in place for later expansions
-    _ = hs_delta
-
     return [story_1, story_2, story_3, story_4]
 
 
@@ -598,7 +457,7 @@ def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
 
 
 # ============================================================
-# Ask NARS (prototype deterministic) - freeform only
+# Ask NARS
 # ============================================================
 def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     ql = (q or "").lower().strip()
@@ -636,7 +495,6 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
     k = calc_kpis(dff, sev_thresh)
 
     st.markdown("### Key Metrics")
-
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
     c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
@@ -647,7 +505,6 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Trends")
-
     roll = monthly_rollup(dff, sev_thresh)
     if roll.empty or roll["trend_month"].nunique() < 2:
         st.caption("Not enough monthly history to show trends (need 2+ months).")
@@ -667,7 +524,6 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     for idx, (col, label, is_money) in enumerate(metrics):
         curr, prev = last_two_months(roll, col)
         delta = pct_change(curr or 0, prev or 0) if prev is not None else None
-
         display_val = fmt_money_compact(curr) if is_money else fmt_int(curr)
         display_delta = None if delta is None else f"{delta:+.1f}%"
         stat_cols[idx].metric(label, display_val, display_delta)
@@ -676,7 +532,14 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
 
     def line(metric_col: str, title: str) -> None:
         st.altair_chart(
-            line_chart(roll, "trend_month:T", f"{metric_col}:Q", title),
+            alt.Chart(roll)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("trend_month:T", title="Month"),
+                y=alt.Y(f"{metric_col}:Q", title=None),
+                tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q")],
+            )
+            .properties(title=title, height=220),
             use_container_width=True,
         )
 
@@ -726,134 +589,19 @@ def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.dataframe(disp, use_container_width=True, hide_index=True)
 
 
-def render_mix_distribution(dff: pd.DataFrame) -> None:
-    st.markdown("### Mix & Distribution")
-
-    left, mid, right = st.columns([1.2, 1.0, 1.2], gap="large")
-
-    with left:
-        status_counts = dff["feature_status"].fillna("UNKNOWN").value_counts().reset_index()
-        status_counts.columns = ["feature_status", "count"]
-        st.altair_chart(
-            donut_chart(status_counts, "feature_status", "count", "Feature Status Mix"),
-            use_container_width=True,
-        )
-
-    with mid:
-        cov = dff["coverage_type"].fillna("UNKNOWN").value_counts().head(10).reset_index()
-        cov.columns = ["coverage_type", "count"]
-        st.altair_chart(
-            bar_chart(cov, "coverage_type", "count", "Top Coverage Types"),
-            use_container_width=True,
-        )
-
-    with right:
-        bins = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 10_000_000_000]
-        labels = ["$0–50K", "$50–100K", "$100–250K", "$250–500K", "$500K–1M", "$1M+"]
-        tmp = dff.copy()
-        tmp["sev_bucket"] = pd.cut(tmp["incurred_amount"], bins=bins, labels=labels, include_lowest=True)
-        hist = tmp["sev_bucket"].value_counts().reindex(labels, fill_value=0).reset_index()
-        hist.columns = ["sev_bucket", "count"]
-        st.altair_chart(
-            bar_chart(hist, "sev_bucket", "count", "Severity Distribution"),
-            use_container_width=True,
-        )
-
-
-def render_geo(dff: pd.DataFrame) -> None:
-    st.markdown("### Geographic Concentration")
-
-    a, b = st.columns(2, gap="large")
-
-    with a:
-        tmp = (
-            dff.groupby("state", dropna=False)["is_open_inventory"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-        )
-        tmp.columns = ["state", "open_features"]
-        st.altair_chart(
-            bar_chart(tmp, "state", "open_features", "Top States by Open Features", horizontal=True),
-            use_container_width=True,
-        )
-
-    with b:
-        tmp = (
-            dff.groupby("state", dropna=False)["incurred_amount"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-        )
-        tmp.columns = ["state", "total_incurred"]
-        st.altair_chart(
-            bar_chart(tmp, "state", "total_incurred", "Top States by Total Incurred", horizontal=True),
-            use_container_width=True,
-        )
-
-
-def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Metric Rolodex (Accident Year)")
-
-    metric = st.selectbox(
-        "Metric",
-        ["Open Features", "Total Features", "Total Incurred", "Paid", "Outstanding", "High Severity Features"],
-        index=0,
-        label_visibility="collapsed",
-    )
-
-    if dff["accident_year"].isna().all():
-        st.caption("No accident year data.")
-        return
-
-    tmp = dff.copy()
-    if metric == "Open Features":
-        tmp = tmp[tmp["is_open_inventory"] == 1]
-        chart_df = tmp.groupby("accident_year").size().reset_index(name="value")
-    elif metric == "Total Features":
-        chart_df = tmp.groupby("accident_year").size().reset_index(name="value")
-    elif metric == "Total Incurred":
-        chart_df = tmp.groupby("accident_year")["incurred_amount"].sum().reset_index(name="value")
-    elif metric == "Paid":
-        chart_df = tmp.groupby("accident_year")["paid_amount"].sum().reset_index(name="value")
-    elif metric == "Outstanding":
-        chart_df = tmp.groupby("accident_year")["outstanding_amount"].sum().reset_index(name="value")
-    else:
-        tmp["is_hs"] = (tmp["incurred_amount"] >= sev_thresh).astype(int)
-        chart_df = tmp.groupby("accident_year")["is_hs"].sum().reset_index(name="value")
-
-    chart_df = chart_df.sort_values("accident_year")
-    st.altair_chart(
-        alt.Chart(chart_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("accident_year:O", title="Accident Year"),
-            y=alt.Y("value:Q", title=None),
-            tooltip=["accident_year", "value"],
-        )
-        .properties(height=260),
-        use_container_width=True,
-    )
-
-
 # ============================================================
 # Main
 # ============================================================
 def main() -> None:
     st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
 
-    # Sticky side panels that DON'T cover the header
-    # (Streamlit columns are flex; sticky needs align-self and parent overflow visible)
     st.markdown(
         """
         <style>
           :root{
-            --stickyTop: 7.0rem; /* push sticky panels below header so they don't cover logo */
+            --stickyTop: 7.0rem;
           }
 
-          /* streamlit containers sometimes block sticky with overflow */
           div[data-testid="stHorizontalBlock"] { overflow: visible !important; }
           div[data-testid="stColumn"] { overflow: visible !important; }
 
@@ -862,16 +610,13 @@ def main() -> None:
             position: sticky;
             top: var(--stickyTop);
             align-self: flex-start;
-
             max-height: calc(100vh - var(--stickyTop) - 1rem);
             overflow-y: auto;
-
-            background: white; /* prevents weird overlay artifacts */
-            z-index: 5;        /* stays above page content, below header */
+            background: white;
+            z-index: 5;
             padding-right: 0.25rem;
           }
 
-          /* tighten top padding a bit */
           .block-container { padding-top: 1.25rem; }
         </style>
         """,
@@ -881,30 +626,18 @@ def main() -> None:
     cfg = get_config()
     init_filter_state()
 
-    try:
-        df, src = load_data(cfg)
-    except Exception as e:
-        st.error("Failed to load data.")
-        st.exception(e)
-        st.stop()
-
+    df, src = load_data(cfg)
     if df.empty:
         st.error("Dataset loaded but returned 0 rows.")
         st.stop()
 
-    # Standardize first
     df_std = standardize_financials(df, strict_incurred_open_only=False)
-
-    # Ensure monthly trends back to 2021
     df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
 
-    # Layout columns
     ribbon_col, main_col, filter_col = st.columns([1.2, 3.0, 1.2], gap="large")
 
-    # Filters (sticky)
     with filter_col:
         st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
-
         st.markdown("### Filters")
 
         states = ["All States"] + safe_list(df_std["state"])
@@ -938,34 +671,23 @@ def main() -> None:
 
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
-
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Apply filters
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
-    # Headlines ribbon (sticky)
     with ribbon_col:
         st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
         render_headlines_ribbon(dff, sev_thresh)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Main content
     with main_col:
-        # Header row:
-        # LEFT: demo caption
-        # MID: big logo
-        # RIGHT: title block
+        # Header
         hL, hM, hR = st.columns([0.35, 0.25, 0.40], vertical_alignment="center")
-
-        with hL:
-            st.caption("Demo environment. Data generated for presentation purposes.")
 
         with hM:
             logo_path = "narslogo.jpg"
             if os.path.exists(logo_path):
-                # Bigger logo
                 st.image(logo_path, use_container_width=True)
 
         with hR:
@@ -977,9 +699,8 @@ def main() -> None:
 
         st.divider()
 
-        # Ask NARS (freeform)
+        # Ask NARS
         st.markdown("### Ask NARS (Prototype)")
-        st.caption("Deterministic responses computed from the filtered dataset.")
 
         qcols = st.columns([5, 1])
         q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
@@ -990,27 +711,15 @@ def main() -> None:
 
         st.divider()
 
-        # KPIs
         render_kpi_row(dff, sev_thresh)
 
         st.divider()
 
-        # Trends
         render_trend_section(dff, sev_thresh)
 
         st.divider()
 
-        # High severity
         render_high_severity_table(dff, sev_thresh)
-
-        st.divider()
-        render_mix_distribution(dff)
-
-        st.divider()
-        render_geo(dff)
-
-        st.divider()
-        render_rolodex(dff, sev_thresh)
 
 
 if __name__ == "__main__":
