@@ -88,13 +88,6 @@ def fmt_money_compact(x) -> str:
     return f"{sign}${v:,.0f}"
 
 
-def fmt_currency_full(x) -> str:
-    try:
-        return f"${float(x):,.0f}"
-    except Exception:
-        return "—"
-
-
 def safe_list(series: pd.Series) -> list:
     return sorted([x for x in series.dropna().unique()])
 
@@ -282,7 +275,7 @@ def load_data(cfg: AppConfig) -> Tuple[pd.DataFrame, str]:
 
 
 # ============================================================
-# Business rules enforcement (fast, demo-safe, defensible)
+# Business rules enforcement
 # ============================================================
 def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) -> pd.DataFrame:
     d = df.copy()
@@ -315,8 +308,8 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
 
 def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-01", seed: int = 7) -> pd.DataFrame:
     """
-    Demo-only: create plausible multi-month history back to `start`.
-    If you already have multiple months, it just returns df as-is.
+    Demo-only: create plausible monthly history back to `start` if the source
+    doesn't already go back that far.
     """
     import numpy as np
 
@@ -325,7 +318,6 @@ def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-
     if d.empty:
         return df
 
-    # If already goes back to start, do nothing
     start_dt = pd.to_datetime(start)
     if d["trend_month"].min() <= start_dt:
         return df
@@ -334,13 +326,11 @@ def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-
     months = pd.date_range(start=start_dt, end=cur_month, freq="MS")
 
     rng = np.random.default_rng(seed)
-
     frames = []
     for m in months:
         f = d.copy()
         f["trend_month"] = m
 
-        # Add gentle drift so lines aren't perfectly flat
         drift = 1.0 + rng.normal(0.0, 0.06, size=len(f))
         drift = np.clip(drift, 0.80, 1.25)
 
@@ -352,8 +342,7 @@ def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-
 
         frames.append(f)
 
-    out = pd.concat(frames, ignore_index=True)
-    return out
+    return pd.concat(frames, ignore_index=True)
 
 
 # ============================================================
@@ -430,7 +419,6 @@ def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
     outstanding = float(dff["outstanding_amount"].sum())
     high_sev = int((dff["incurred_amount"] >= sev_thresh).sum())
     total_features = int(len(dff))
-
     reserve_ratio = (outstanding / total_incurred * 100.0) if total_incurred else 0.0
 
     return dict(
@@ -447,20 +435,10 @@ def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
 def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
     m = dff.dropna(subset=["trend_month"]).copy()
     if m.empty:
-        return pd.DataFrame(
-            columns=[
-                "trend_month",
-                "open_features",
-                "total_incurred",
-                "paid",
-                "outstanding",
-                "high_sev",
-                "total_features",
-                "reserve_ratio",
-            ]
-        )
+        return pd.DataFrame(columns=["trend_month"])
 
     m["is_hs"] = (m["incurred_amount"] >= sev_thresh).astype(int)
+
     roll = (
         m.groupby("trend_month", as_index=False)
         .agg(
@@ -545,15 +523,9 @@ def bar_chart(df: pd.DataFrame, x: str, y: str, title: str, horizontal: bool = F
 # Narrative (nuanced headlines)
 # ============================================================
 def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
-    """
-    Produces 4 "news-style" bullets.
-    It's intentionally interpretive. The point is to show what the *future* LLM
-    will do, not to pretend these are actuarial truth tablets.
-    """
     k = calc_kpis(dff, sev_thresh)
     roll = monthly_rollup(dff, sev_thresh)
 
-    # If we have at least 2 months, derive deltas; otherwise keep it descriptive.
     open_curr, open_prev = last_two_months(roll, "open_features")
     inc_curr, inc_prev = last_two_months(roll, "total_incurred")
     hs_curr, hs_prev = last_two_months(roll, "high_sev")
@@ -564,7 +536,6 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
     hs_delta = pct_change(hs_curr or 0, hs_prev or 0) if hs_prev is not None else None
     rr_delta = pct_change(rr_curr or 0, rr_prev or 0) if rr_prev is not None else None
 
-    # Geographic + year concentration
     year_line = "Claim volume looks broadly distributed across accident years."
     if k["total_features"] and dff["accident_year"].notna().any():
         ay = dff.groupby("accident_year").size().sort_values(ascending=False)
@@ -580,17 +551,13 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
         if len(top_states) >= 2:
             share = stc.iloc[:2].sum() / k["total_features"] * 100
             state_line = f"{top_states[0]} and {top_states[1]} make up ~{share:.1f}% of features, suggesting regional concentration risk."
-        elif len(top_states) == 1:
-            state_line = f"{top_states[0]} represents 100% of the current selection (filter-driven concentration)."
 
-    # Build "news" interpretations
     open_dir = direction_word(open_delta)
     open_strength = strength_word(open_delta)
     inc_dir = direction_word(inc_delta)
     inc_strength = strength_word(inc_delta)
     rr_dir = direction_word(rr_delta)
 
-    # These are intentionally plausible, not definitive.
     story_1 = (
         f"Open inventory is {open_strength} {open_dir}. "
         f"If this persists, it can signal slower claim resolution, fresh reporting inflow, or operational capacity constraints "
@@ -615,14 +582,15 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
         f"Watch for clustering by coverage and state. {state_line} {year_line}"
     )
 
+    # We’re not using hs_delta yet, but keeping it in place for later expansions
+    _ = hs_delta
+
     return [story_1, story_2, story_3, story_4]
 
 
 def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Today’s Headlines")
-
     bullets = build_headline_story(dff, sev_thresh)
-    # Styled like the “ribbon” tiles you already like
     st.info(bullets[0])
     st.success(bullets[1])
     st.warning(bullets[2])
@@ -681,12 +649,10 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Trends")
 
     roll = monthly_rollup(dff, sev_thresh)
-
     if roll.empty or roll["trend_month"].nunique() < 2:
         st.caption("Not enough monthly history to show trends (need 2+ months).")
         return
 
-    # User requested back to 2021: show all months we have (after synth)
     roll = roll.sort_values("trend_month")
 
     metrics = [
@@ -704,33 +670,33 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
 
         display_val = fmt_money_compact(curr) if is_money else fmt_int(curr)
         display_delta = None if delta is None else f"{delta:+.1f}%"
-
         stat_cols[idx].metric(label, display_val, display_delta)
 
     st.divider()
 
-    r1 = st.columns(3)
-    r2 = st.columns(2)
-    charts = [
-        ("open_features", "Open Features"),
-        ("total_incurred", "Total Incurred ($)"),
-        ("paid", "Paid ($)"),
-        ("outstanding", "Outstanding ($)"),
-        ("high_sev", "High Severity Features"),
-    ]
-    containers = [r1[0], r1[1], r1[2], r2[0], r2[1]]
+    def line(metric_col: str, title: str) -> None:
+        st.altair_chart(
+            line_chart(roll, "trend_month:T", f"{metric_col}:Q", title),
+            use_container_width=True,
+        )
 
-    for (metric_col, title), container in zip(charts, containers):
-        with container:
-            st.altair_chart(
-                line_chart(roll, "trend_month:T", f"{metric_col}:Q", title),
-                use_container_width=True,
-            )
+    r1 = st.columns(3)
+    with r1[0]:
+        line("open_features", "Open Features")
+    with r1[1]:
+        line("total_incurred", "Total Incurred ($)")
+    with r1[2]:
+        line("paid", "Paid ($)")
+
+    r2 = st.columns(2)
+    with r2[0]:
+        line("outstanding", "Outstanding ($)")
+    with r2[1]:
+        line("high_sev", "High Severity Features")
 
 
 def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Top 10 High Severity Claims (≥ threshold)")
-
     top_hs = (
         dff[dff["incurred_amount"] >= sev_thresh]
         .sort_values("incurred_amount", ascending=False)
@@ -878,19 +844,34 @@ def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
 def main() -> None:
     st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
 
-    # Sticky side columns (ribbon + filters)
+    # Sticky side panels that DON'T cover the header
+    # (Streamlit columns are flex; sticky needs align-self and parent overflow visible)
     st.markdown(
         """
         <style>
-          /* make our wrapper sticky and scrollable */
+          :root{
+            --stickyTop: 7.0rem; /* push sticky panels below header so they don't cover logo */
+          }
+
+          /* streamlit containers sometimes block sticky with overflow */
+          div[data-testid="stHorizontalBlock"] { overflow: visible !important; }
+          div[data-testid="stColumn"] { overflow: visible !important; }
+
           .sticky-col {
+            position: -webkit-sticky;
             position: sticky;
-            top: 0.75rem;
-            max-height: calc(100vh - 1.5rem);
+            top: var(--stickyTop);
+            align-self: flex-start;
+
+            max-height: calc(100vh - var(--stickyTop) - 1rem);
             overflow-y: auto;
+
+            background: white; /* prevents weird overlay artifacts */
+            z-index: 5;        /* stays above page content, below header */
             padding-right: 0.25rem;
           }
-          /* slightly tighten page padding so sticky feels clean */
+
+          /* tighten top padding a bit */
           .block-container { padding-top: 1.25rem; }
         </style>
         """,
@@ -911,25 +892,30 @@ def main() -> None:
         st.error("Dataset loaded but returned 0 rows.")
         st.stop()
 
-    # Layout:
-    # Left = Headlines ribbon (sticky)
-    # Center = Main content
-    # Right = Filters (sticky)
+    # Standardize first
+    df_std = standardize_financials(df, strict_incurred_open_only=False)
+
+    # Ensure monthly trends back to 2021
+    df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
+
+    # Layout columns
     ribbon_col, main_col, filter_col = st.columns([1.2, 3.0, 1.2], gap="large")
 
+    # Filters (sticky)
     with filter_col:
         st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
+
         st.markdown("### Filters")
 
-        states = ["All States"] + safe_list(df["state"])
-        years = ["All Years"] + [str(int(y)) for y in safe_list(df["accident_year"]) if pd.notna(y)]
-        covs = ["All Coverages"] + safe_list(df["coverage_type"])
-        adjs = ["All Adjusters"] + safe_list(df["adjuster"])
-        lobs = ["All Lines"] + safe_list(df["line_of_business"])
-        statuses = ["All Statuses"] + safe_list(df["feature_status"])
-        causes = ["All Causes"] + safe_list(df["cause_of_loss"])
-        vendors = ["All Vendors"] + safe_list(df["vendor_name"])
-        firms = ["All Firms"] + safe_list(df["defense_firm"])
+        states = ["All States"] + safe_list(df_std["state"])
+        years = ["All Years"] + [str(int(y)) for y in safe_list(df_std["accident_year"]) if pd.notna(y)]
+        covs = ["All Coverages"] + safe_list(df_std["coverage_type"])
+        adjs = ["All Adjusters"] + safe_list(df_std["adjuster"])
+        lobs = ["All Lines"] + safe_list(df_std["line_of_business"])
+        statuses = ["All Statuses"] + safe_list(df_std["feature_status"])
+        causes = ["All Causes"] + safe_list(df_std["cause_of_loss"])
+        vendors = ["All Vendors"] + safe_list(df_std["vendor_name"])
+        firms = ["All Firms"] + safe_list(df_std["defense_firm"])
 
         st.selectbox("State", states, key="f_state")
         st.selectbox("Accident Year", years, key="f_acc_year")
@@ -952,37 +938,42 @@ def main() -> None:
 
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
+
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Standardize first
-    df_std = standardize_financials(df, strict_incurred_open_only=False)
-
-    # Ensure we have monthly trends back to 2021 (demo synth)
-    df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
-
-    # Filtered dataset used for BOTH ribbon and main
+    # Apply filters
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
+    # Headlines ribbon (sticky)
     with ribbon_col:
         st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
         render_headlines_ribbon(dff, sev_thresh)
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # Main content
     with main_col:
-        # Header with logo
-        h1, h2 = st.columns([0.12, 0.88], vertical_alignment="center")
-        logo_path = "narslogo.jpg"
-        if os.path.exists(logo_path):
-            h1.image(logo_path, use_container_width=True)
-        h2.markdown("## Claims Intelligence – Daily Summary")
-        st.caption("Demo environment. Data generated for presentation purposes.")
+        # Header row:
+        # LEFT: demo caption
+        # MID: big logo
+        # RIGHT: title block
+        hL, hM, hR = st.columns([0.35, 0.25, 0.40], vertical_alignment="center")
 
-        # As-of
-        as_of = "Latest"
-        if dff["report_date"].notna().any():
-            as_of = str(dff["report_date"].max().date())
-        st.markdown(f"**As of:** {as_of}")
+        with hL:
+            st.caption("Demo environment. Data generated for presentation purposes.")
+
+        with hM:
+            logo_path = "narslogo.jpg"
+            if os.path.exists(logo_path):
+                # Bigger logo
+                st.image(logo_path, use_container_width=True)
+
+        with hR:
+            st.markdown("## Claims Intelligence – Daily Summary")
+            as_of = "Latest"
+            if dff["report_date"].notna().any():
+                as_of = str(dff["report_date"].max().date())
+            st.markdown(f"**As of:** {as_of}")
 
         st.divider()
 
@@ -994,23 +985,22 @@ def main() -> None:
         q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
         if qcols[1].button("Ask"):
             st.session_state["_ask_answer"] = answer_question(dff, q, sev_thresh)
-
         if st.session_state.get("_ask_answer"):
             st.write(st.session_state["_ask_answer"])
 
         st.divider()
 
-        # KPIs with headline above (and compact money)
+        # KPIs
         render_kpi_row(dff, sev_thresh)
 
         st.divider()
 
-        # Trends (renamed)
+        # Trends
         render_trend_section(dff, sev_thresh)
 
         st.divider()
 
-        # High Severity table directly below trends
+        # High severity
         render_high_severity_table(dff, sev_thresh)
 
         st.divider()
