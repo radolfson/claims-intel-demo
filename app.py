@@ -128,11 +128,10 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
         d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
 
     # Normalize coverage: translate coverage_code into a human coverage label.
-    # If we can't map it, fall back to coverage_code, then existing coverage_type.
+    # If we can't map it, fall back to coverage_code.
     code = d["coverage_code"].astype("string").fillna("")
     mapped = code.map(COVERAGE_CODE_TO_COVERAGE).astype("string")
     d["coverage_type"] = mapped.where(mapped.notna() & (mapped != ""), d["coverage_code"]).astype("string")
-    d["coverage_type"] = d["coverage_type"].where(d["coverage_type"].notna() & (d["coverage_type"] != ""), d["coverage_type"])
 
     if "is_open_inventory" not in d.columns:
         d["is_open_inventory"] = d["feature_status"].isin(list(STATUS_OPEN_SET)).astype(int)
@@ -247,24 +246,21 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
     Rules:
       - DENIED: paid/outstanding/incurred = 0
       - CLOSED: outstanding = 0, incurred = paid
-      - Otherwise: incurred = max(incurred, paid + outstanding) (keeps things sane)
+      - Otherwise: incurred = max(incurred, paid + outstanding)
       - Optional strict: if status not in OPEN/PENDING/REOPEN then incurred = 0
     """
     d = df.copy()
     status = d["feature_status"].fillna("UNKNOWN").astype(str)
 
-    # Denied => zero everything
     denied_mask = status.str.upper().eq("DENIED")
     d.loc[denied_mask, ["paid_amount", "outstanding_amount", "incurred_amount"]] = 0.0
     d.loc[denied_mask, "is_open_inventory"] = 0
 
-    # Closed => outstanding 0, incurred = paid
     closed_mask = status.str.upper().eq("CLOSED")
     d.loc[closed_mask, "outstanding_amount"] = 0.0
     d.loc[closed_mask, "incurred_amount"] = d.loc[closed_mask, "paid_amount"]
     d.loc[closed_mask, "is_open_inventory"] = 0
 
-    # Recompute incurred sanity for remaining
     sane_mask = ~(denied_mask | closed_mask)
     recomputed = d.loc[sane_mask, "paid_amount"] + d.loc[sane_mask, "outstanding_amount"]
     d.loc[sane_mask, "incurred_amount"] = d.loc[sane_mask, ["incurred_amount"]].max(axis=1)
@@ -283,10 +279,7 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
 
 def synthesize_monthly_history(df: pd.DataFrame, months_back: int = 9, seed: int = 7) -> pd.DataFrame:
     """
-    Demo-only helper: if you only have 1 month, we create a plausible multi-month history
-    by duplicating features across prior months with small randomized drift.
-    This does NOT change feature-level totals in the "current month" slice; it only
-    enables trend charts to render.
+    Demo-only helper: if you only have 1 month, create plausible multi-month history.
     """
     import numpy as np
 
@@ -305,12 +298,13 @@ def synthesize_monthly_history(df: pd.DataFrame, months_back: int = 9, seed: int
         f = d.copy()
         f["trend_month"] = m
 
-        # Apply gentle drift so charts look real but not insane
-        drift = 1.0 + rng.normal(0.0, 0.06, size=len(f))  # ~6% std dev
+        drift = 1.0 + rng.normal(0.0, 0.06, size=len(f))
         drift = np.clip(drift, 0.80, 1.25)
 
         f["paid_amount"] = (f["paid_amount"] * drift).round(2)
-        f["outstanding_amount"] = (f["outstanding_amount"] * (1.0 + rng.normal(0.0, 0.05, size=len(f)))).clip(lower=0).round(2)
+        f["outstanding_amount"] = (
+            f["outstanding_amount"] * (1.0 + rng.normal(0.0, 0.05, size=len(f)))
+        ).clip(lower=0).round(2)
         f["incurred_amount"] = (f["paid_amount"] + f["outstanding_amount"]).round(2)
 
         frames.append(f)
@@ -342,7 +336,6 @@ def init_filter_state() -> None:
 
 
 def reset_filters() -> None:
-
     for k in list(st.session_state.keys()):
         if k.startswith("f_") or k == "_filters_initialized":
             del st.session_state[k]
@@ -406,7 +399,6 @@ def filters_active() -> bool:
 
 
 # ============================================================
-
 # KPI + MoM helpers
 # ============================================================
 def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
@@ -429,7 +421,17 @@ def calc_kpis(dff: pd.DataFrame, sev_thresh: float) -> dict:
 def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
     m = dff.dropna(subset=["trend_month"]).copy()
     if m.empty:
-        return pd.DataFrame(columns=["trend_month", "open_features", "total_incurred", "paid", "outstanding", "high_sev", "total_features"])
+        return pd.DataFrame(
+            columns=[
+                "trend_month",
+                "open_features",
+                "total_incurred",
+                "paid",
+                "outstanding",
+                "high_sev",
+                "total_features",
+            ]
+        )
 
     m["is_hs"] = (m["incurred_amount"] >= sev_thresh).astype(int)
     roll = (
@@ -530,7 +532,10 @@ def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
         top_years = ay.index[:2].tolist()
         if len(top_years) >= 2:
             top_share = ay.iloc[:2].sum() / total_ct * 100
-            year_msg = f"Open features total {open_ct:,}, concentrated in accident years {int(top_years[0])}–{int(top_years[1])} (~{top_share:.1f}% of inventory)."
+            year_msg = (
+                f"Open features total {open_ct:,}, concentrated in accident years "
+                f"{int(top_years[0])}–{int(top_years[1])} (~{top_share:.1f}% of inventory)."
+            )
         elif len(top_years) == 1:
             year_msg = f"Open features total {open_ct:,}, concentrated in accident year {int(top_years[0])} (filtered selection)."
 
@@ -546,13 +551,19 @@ def render_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
 
     st.markdown("### Today’s Headlines")
     st.info(year_msg)
-    st.success(f"High severity features represent {hs_pct:.1f}% of open inventory ({hs_ct:,} features at ≥ {fmt_currency(sev_thresh)}).")
-    st.warning(f"Total incurred stands at {fmt_currency(total_incurred)} with {fmt_currency(total_out)} outstanding ({out_pct:.1f}% case reserves).")
+    st.success(
+        f"High severity features represent {hs_pct:.1f}% of open inventory "
+        f"({hs_ct:,} features at ≥ {fmt_currency(sev_thresh)})."
+    )
+    st.warning(
+        f"Total incurred stands at {fmt_currency(total_incurred)} with "
+        f"{fmt_currency(total_out)} outstanding ({out_pct:.1f}% case reserves)."
+    )
     st.info(state_msg)
 
 
 # ============================================================
-# Ask NARS (prototype deterministic) + Quick buttons
+# Ask NARS (prototype deterministic)
 # ============================================================
 def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     ql = (q or "").lower().strip()
@@ -589,14 +600,27 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 # ============================================================
 # UI Sections
 # ============================================================
-def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
+def render_kpis_and_headlines(dff: pd.DataFrame, sev_thresh: float) -> None:
+    """
+    Left: vertical KPI stack
+    Right: headlines (only when filters are NOT active)
+    """
     k = calc_kpis(dff, sev_thresh)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Open Features", fmt_int(k["open_features"]))
-    c2.metric("Total Incurred", fmt_currency(k["total_incurred"]))
-    c3.metric("Paid", fmt_currency(k["paid"]))
-    c4.metric("Outstanding", fmt_currency(k["outstanding"]))
-    c5.metric("High Severity Features", fmt_int(k["high_sev"]))
+
+    left, right = st.columns([1, 2], gap="large")
+
+    with left:
+        st.metric("Open Features", fmt_int(k["open_features"]))
+        st.metric("Total Incurred", fmt_currency(k["total_incurred"]))
+        st.metric("Paid", fmt_currency(k["paid"]))
+        st.metric("Outstanding", fmt_currency(k["outstanding"]))
+        st.metric("High Severity Features", fmt_int(k["high_sev"]))
+
+    with right:
+        if not filters_active():
+            render_headlines(dff, sev_thresh)
+        else:
+            st.caption("Headlines hidden while filters are active.")
 
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
@@ -657,12 +681,18 @@ def render_mix_distribution(dff: pd.DataFrame) -> None:
     with left:
         status_counts = dff["feature_status"].fillna("UNKNOWN").value_counts().reset_index()
         status_counts.columns = ["feature_status", "count"]
-        st.altair_chart(donut_chart(status_counts, "feature_status", "count", "Feature Status Mix"), use_container_width=True)
+        st.altair_chart(
+            donut_chart(status_counts, "feature_status", "count", "Feature Status Mix"),
+            use_container_width=True,
+        )
 
     with mid:
         cov = dff["coverage_type"].fillna("UNKNOWN").value_counts().head(10).reset_index()
         cov.columns = ["coverage_type", "count"]
-        st.altair_chart(bar_chart(cov, "coverage_type", "count", "Top Coverage Types"), use_container_width=True)
+        st.altair_chart(
+            bar_chart(cov, "coverage_type", "count", "Top Coverage Types"),
+            use_container_width=True,
+        )
 
     with right:
         bins = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 10_000_000_000]
@@ -671,7 +701,10 @@ def render_mix_distribution(dff: pd.DataFrame) -> None:
         tmp["sev_bucket"] = pd.cut(tmp["incurred_amount"], bins=bins, labels=labels, include_lowest=True)
         hist = tmp["sev_bucket"].value_counts().reindex(labels, fill_value=0).reset_index()
         hist.columns = ["sev_bucket", "count"]
-        st.altair_chart(bar_chart(hist, "sev_bucket", "count", "Severity Distribution"), use_container_width=True)
+        st.altair_chart(
+            bar_chart(hist, "sev_bucket", "count", "Severity Distribution"),
+            use_container_width=True,
+        )
 
 
 def render_geo(dff: pd.DataFrame) -> None:
@@ -680,14 +713,32 @@ def render_geo(dff: pd.DataFrame) -> None:
     a, b = st.columns(2, gap="large")
 
     with a:
-        tmp = dff.groupby("state", dropna=False)["is_open_inventory"].sum().sort_values(ascending=False).head(10).reset_index()
+        tmp = (
+            dff.groupby("state", dropna=False)["is_open_inventory"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+        )
         tmp.columns = ["state", "open_features"]
-        st.altair_chart(bar_chart(tmp, "state", "open_features", "Top States by Open Features", horizontal=True), use_container_width=True)
+        st.altair_chart(
+            bar_chart(tmp, "state", "open_features", "Top States by Open Features", horizontal=True),
+            use_container_width=True,
+        )
 
     with b:
-        tmp = dff.groupby("state", dropna=False)["incurred_amount"].sum().sort_values(ascending=False).head(10).reset_index()
+        tmp = (
+            dff.groupby("state", dropna=False)["incurred_amount"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+        )
         tmp.columns = ["state", "total_incurred"]
-        st.altair_chart(bar_chart(tmp, "state", "total_incurred", "Top States by Total Incurred", horizontal=True), use_container_width=True)
+        st.altair_chart(
+            bar_chart(tmp, "state", "total_incurred", "Top States by Total Incurred", horizontal=True),
+            use_container_width=True,
+        )
 
 
 def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
@@ -722,18 +773,25 @@ def render_rolodex(dff: pd.DataFrame, sev_thresh: float) -> None:
 
     chart_df = chart_df.sort_values("accident_year")
     st.altair_chart(
-        alt.Chart(chart_df).mark_bar().encode(
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
             x=alt.X("accident_year:O", title="Accident Year"),
             y=alt.Y("value:Q", title=None),
             tooltip=["accident_year", "value"],
-        ).properties(height=260),
+        )
+        .properties(height=260),
         use_container_width=True,
     )
 
 
 def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("#### High Severity Features (≥ threshold)")
-    top_hs = dff[dff["incurred_amount"] >= sev_thresh].sort_values("incurred_amount", ascending=False).head(50)
+    st.markdown("### Top 10 High Severity Claims (≥ threshold)")
+    top_hs = (
+        dff[dff["incurred_amount"] >= sev_thresh]
+        .sort_values("incurred_amount", ascending=False)
+        .head(10)
+    )
     cols = [
         "feature_key",
         "claim_number",
@@ -776,7 +834,6 @@ def main() -> None:
     with filter_col:
         st.markdown("### Filters")
 
-        # Options
         states = ["All States"] + safe_list(df["state"])
         years = ["All Years"] + [str(int(y)) for y in safe_list(df["accident_year"]) if pd.notna(y)]
         covs = ["All Coverages"] + safe_list(df["coverage_type"])
@@ -810,8 +867,6 @@ def main() -> None:
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
 
-
-
     with main_col:
         # Header with logo
         h1, h2 = st.columns([0.12, 0.88], vertical_alignment="center")
@@ -822,7 +877,6 @@ def main() -> None:
         st.caption("Demo environment. Data generated for presentation purposes.")
 
         sev_thresh = float(st.session_state["f_sev_thresh"])
-
 
         # Apply financial rules early so EVERYTHING uses consistent definitions
         df_std = standardize_financials(df, strict_incurred_open_only=False)
@@ -842,16 +896,19 @@ def main() -> None:
         st.markdown(f"**As of:** {as_of}")
 
         st.divider()
-        render_kpi_row(dff, sev_thresh)
+
+        # NEW: KPI stack (left) + Headlines (right)
+        render_kpis_and_headlines(dff, sev_thresh)
 
         st.divider()
+
+        # Ask NARS (kept)
         st.markdown("### Ask NARS (Prototype)")
         st.caption("Deterministic responses computed from the filtered dataset.")
 
-        # Quick buttons
         b1, b2, b3, b4 = st.columns(4)
         if b1.button("High Severity Features"):
-            st.session_state["_ask_answer"] = "Showing High Severity Features table below."
+            st.session_state["_ask_answer"] = "High Severity table is shown below Trends."
         if b2.button("Open Features"):
             st.session_state["_ask_answer"] = f"Open inventory features: {fmt_int((dff['is_open_inventory'] == 1).sum())}."
         if b3.button("Total Incurred"):
@@ -871,15 +928,15 @@ def main() -> None:
         if st.session_state.get("_ask_answer"):
             st.write(st.session_state["_ask_answer"])
 
-        # Show High Severity table (replaces the previous severe table)
-        render_high_severity_table(dff, sev_thresh)
-
         st.divider()
-        if not filters_active():
-            render_headlines(dff, sev_thresh)
 
-        st.divider()
+        # Trends
         render_trend_section(dff, sev_thresh)
+
+        st.divider()
+
+        # NEW: High Severity table directly below trends
+        render_high_severity_table(dff, sev_thresh)
 
         st.divider()
         render_mix_distribution(dff)
@@ -889,7 +946,6 @@ def main() -> None:
 
         st.divider()
         render_rolodex(dff, sev_thresh)
-
 
 
 if __name__ == "__main__":
