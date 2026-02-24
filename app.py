@@ -965,7 +965,7 @@ def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) ->
 # Main
 # ============================================================
 def main() -> None:
-    st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
+    st.set_page_config(page_title="Cover Whale - Daily", layout="wide")
 
     # Sticky side columns (headlines + filters) without covering header/logo
     st.markdown(
@@ -1096,7 +1096,7 @@ def main() -> None:
                 """
                 <div style="line-height:1.10; padding-top:10px;">
                   <div style="font-size:32px; font-weight:650; letter-spacing:0.3px;">
-                    Claims Intelligence – Daily Summary
+                    Cover Whale – Daily
                   </div>
                 </div>
                 """,
