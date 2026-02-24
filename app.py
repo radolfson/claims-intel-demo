@@ -976,80 +976,101 @@ def main() -> None:
     # ============================================================
     st.markdown(
         """
-<style>
-  :root{
-    --leftPanelWidth: 22rem;
-    --rightPanelWidth: 21rem;
-    --panelTop: 8.2rem;   /* slightly lower for better masthead spacing */
-    --outerGutter: 2.0rem;
-  }
+        <style>
+          :root{
+            --leftPanelWidth: 22.5rem;
+            --rightPanelWidth: 20.5rem;
+            --panelTop: 7.8rem; /* below masthead */
+          }
 
-  /* MAIN CONTENT COLUMN */
-  .block-container {
-    padding-top: 4.5rem;
-    padding-left: calc(var(--leftPanelWidth) + var(--outerGutter));
-    padding-right: calc(var(--rightPanelWidth) + var(--outerGutter));
-    max-width: 1600px;
-  }
+          /* Main page padding to make room for fixed panels */
+          .block-container {
+            max-width: 1750px;
+            margin-left: auto;
+            margin-right: auto;
+            padding-top: 4.4rem;
+            padding-left: calc(var(--leftPanelWidth) + 1.75rem);
+            padding-right: calc(var(--rightPanelWidth) + 1.25rem);
+          }
 
-  /* RIGHT FILTER PANEL */
-  section[data-testid="stSidebar"]{
-    position: fixed !important;
-    top: 0 !important;
-    bottom: 0 !important;
-    right: var(--outerGutter) !important;
-    left: auto !important;
-    width: var(--rightPanelWidth) !important;
-    min-width: var(--rightPanelWidth) !important;
-    max-width: var(--rightPanelWidth) !important;
-    border-left: 1px solid rgba(16,42,67,0.08);
-    padding-left: 0.5rem;
-  }
+          /* Sidebar dock to RIGHT + size */
+          section[data-testid="stSidebar"]{
+            left: auto !important;
+            right: 0.75rem !important;
+            width: var(--rightPanelWidth) !important;
+            min-width: var(--rightPanelWidth) !important;
+            max-width: var(--rightPanelWidth) !important;
+            border-left: 1px solid rgba(16,42,67,0.10);
+            background: #F7FAFC;
+            box-shadow: 0 2px 10px rgba(16,42,67,0.06);
+            border-radius: 12px;
+            margin-top: 0.75rem;
+            margin-bottom: 0.75rem;
+          }
+          section[data-testid="stSidebar"] > div{
+            padding: 0.75rem 0.65rem 1.0rem 0.65rem;
+            height: 100vh;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+          }
 
-  section[data-testid="stSidebar"] > div{
-    height: 100vh;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
 
-  /* Remove collapse controls */
-  [data-testid="collapsedControl"],
-  button[data-testid="stSidebarCollapseButton"],
-  button[title="Close sidebar"],
-  button[title="Open sidebar"],
-  a[title="Open sidebar"],
-  a[title="Close sidebar"]{
-    display: none !important;
-  }
+          /* Force sidebar to behave like a fixed right rail (Streamlit renders it on the left by default) */
+          section[data-testid="stSidebar"]{
+            position: fixed !important;
+            top: 0 !important;
+            bottom: 0 !important;
+            right: 0 !important;
+            left: auto !important;
+            transform: none !important;
+            z-index: 100 !important;
+          }
 
-  /* LEFT HEADLINES PANEL */
-  #left-headlines-panel{
-    position: fixed;
-    top: var(--panelTop);
-    left: var(--outerGutter);
-    width: var(--leftPanelWidth);
-    max-height: calc(100vh - var(--panelTop) - 2rem);
-    overflow: hidden;
-  }
+          /* Remove the collapse/expand control entirely */
+          [data-testid="collapsedControl"]{ display: none !important; }
+          button[data-testid="stSidebarCollapseButton"]{ display: none !important; }
+          button[title="Close sidebar"]{ display: none !important; }
+          button[title="Open sidebar"]{ display: none !important; }
 
-  .headline-title{
-    font-size: 1.35rem;
-    font-weight: 800;
-    margin-bottom: 1rem;
-    color: #102A43;
-  }
+          /* In some Streamlit builds the control is an <a> */
+          a[title="Open sidebar"], a[title="Close sidebar"]{ display: none !important; }
 
-  .headline-box{
-    background: #F3F6FA;
-    border-left: 6px solid #1F4E79;
-    padding: 1.15rem 1.1rem;
-    margin-bottom: 1rem;
-    border-radius: 14px;
-    font-size: 1.08rem;
-    line-height: 1.6;
-    color: #102A43;
-  }
-</style>
+          /* Hide any remaining sidebar toggle chevrons / collapsed controls */
+          [data-testid="stSidebarCollapsedControl"]{ display:none !important; }
+          [data-testid="stSidebarNav"]{ display:none !important; }
+
+
+          /* Fixed left headlines panel */
+          #left-headlines-panel{
+            position: fixed;
+            top: var(--panelTop);
+            left: 1.25rem;
+            width: var(--leftPanelWidth);
+            max-height: calc(100vh - var(--panelTop) - 1rem);
+            overflow: hidden; /* stay put; no internal scroll */
+            background: transparent;
+            z-index: 10;
+          }
+
+          .headline-title{
+            font-size: 1.35rem;
+            font-weight: 800;
+            margin: 0.25rem 0 0.85rem 0;
+            color: #102A43;
+          }
+
+          .headline-box{
+            background: #F3F6FA;
+            border-left: 6px solid #1F4E79;
+            padding: 1.05rem 1.0rem;
+            margin: 0.85rem 0;
+            border-radius: 12px;
+            font-size: 1.08rem;
+            line-height: 1.55;
+            color: #102A43;
+            box-shadow: 0 1px 0 rgba(16,42,67,0.06);
+          }
+        </style>
         """,
         unsafe_allow_html=True,
     )
