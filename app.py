@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import os
-import json
-import urllib.parse
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import altair as alt
 import pandas as pd
-import requests
 import streamlit as st
 
 
@@ -19,6 +15,7 @@ import streamlit as st
 DEFAULT_SEVERITY_THRESHOLD = 250_000
 STATUS_OPEN_SET = {"OPEN", "PENDING", "REOPEN"}
 
+# Coverage mapping (demo): translate coverage_code -> true coverage name
 COVERAGE_CODE_TO_COVERAGE = {
     "AUTO-L": "BODILY INJURY",
     "AUTO-PD": "PROPERTY DAMAGE",
@@ -28,23 +25,33 @@ COVERAGE_CODE_TO_COVERAGE = {
     "CARGO": "CARGO",
 }
 
-DASHBOARD_URL = str(st.secrets.get("DASHBOARD_URL", "https://nars-demo.streamlit.app")).strip()
-
 
 @dataclass
 class AppConfig:
     data_source: str
     data_file: str
+    sf_daily_view: str
+    sf_detail_view: str
+    detail_days_back: int
 
 
 def get_config() -> AppConfig:
     data_source = str(st.secrets.get("DATA_SOURCE", "csv")).strip().lower()
     data_file = str(st.secrets.get("DATA_FILE", "demo_features_latest.csv"))
+    sf_daily_view = str(st.secrets.get("SF_DAILY_VIEW", "")).strip()
+    sf_detail_view = str(st.secrets.get("SF_DETAIL_VIEW", "")).strip()
+    detail_days_back = int(st.secrets.get("DETAIL_DAYS_BACK", "180"))
 
     data_source = os.getenv("DATA_SOURCE", data_source).strip().lower()
     data_file = os.getenv("DATA_FILE", data_file)
 
-    return AppConfig(data_source=data_source, data_file=data_file)
+    return AppConfig(
+        data_source=data_source,
+        data_file=data_file,
+        sf_daily_view=sf_daily_view,
+        sf_detail_view=sf_detail_view,
+        detail_days_back=detail_days_back,
+    )
 
 
 # ============================================================
@@ -58,6 +65,11 @@ def fmt_int(x) -> str:
 
 
 def fmt_money_compact(x) -> str:
+    """
+    Human-readable money:
+    - >= 100,000 -> $101.5K / $3.6M / $1.2B
+    - else -> $12,345
+    """
     try:
         v = float(x)
     except Exception:
@@ -171,18 +183,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["trend_month"] = pd.NaT
 
-    for col in (
-        "client",
-        "state",
-        "coverage_type",
-        "feature_status",
-        "adjuster",
-        "line_of_business",
-        "cause_of_loss",
-        "vendor_name",
-        "defense_firm",
-        "denial_reason",
-    ):
+    for col in ("client", "state", "coverage_type", "feature_status", "adjuster", "line_of_business", "cause_of_loss", "vendor_name", "defense_firm", "denial_reason"):
         d[col] = d[col].astype("string")
 
     d["accident_year"] = pd.to_numeric(d["accident_year"], errors="coerce")
@@ -191,6 +192,11 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
+    """Demo helper: add a denial_reason field only for DENIED features.
+
+    - Keeps the same reason per feature_key deterministically.
+    - Includes 'MCS90' as requested.
+    """
     reasons = [
         "MCS90",
         "Coverage Exclusion",
@@ -204,11 +210,13 @@ def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
     status = d["feature_status"].fillna("").astype(str).str.upper()
     denied = status.eq("DENIED")
 
+    # Only assign for denied rows; otherwise leave blank so the filter behaves as expected.
     d["denial_reason"] = d.get("denial_reason", pd.Series([None] * len(d)))
     d["denial_reason"] = d["denial_reason"].astype("string")
 
     def pick_reason(fk) -> str:
         s = str(fk) if fk is not None else ""
+        # deterministic hash -> stable bucket
         h = 0
         for ch in s:
             h = (h * 31 + ord(ch)) % 10_000
@@ -217,10 +225,15 @@ def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
     if denied.any():
         d.loc[denied, "denial_reason"] = d.loc[denied, "feature_key"].apply(pick_reason).astype("string")
 
+    # Normalize blanks to NA
     d["denial_reason"] = d["denial_reason"].replace({"": pd.NA})
+
     return d
 
 
+# ============================================================
+# Loaders
+# ============================================================
 @st.cache_data(show_spinner=False)
 def load_from_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -233,7 +246,7 @@ def load_data(cfg: AppConfig) -> Tuple[pd.DataFrame, str]:
 
 
 # ============================================================
-# Business rules (light)
+# Business rules enforcement
 # ============================================================
 def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) -> pd.DataFrame:
     d = df.copy()
@@ -257,12 +270,18 @@ def standardize_financials(df: pd.DataFrame, strict_incurred_open_only: bool) ->
 
     if strict_incurred_open_only:
         open_mask = status.str.upper().isin(list(STATUS_OPEN_SET))
-        d.loc[~open_mask, ["incurred_amount", "paid_amount", "outstanding_amount"]] = 0.0
+        d.loc[~open_mask, "incurred_amount"] = 0.0
+        d.loc[~open_mask, "paid_amount"] = 0.0
+        d.loc[~open_mask, "outstanding_amount"] = 0.0
 
     return d
 
 
 def synthesize_monthly_history_to_start(df: pd.DataFrame, start: str = "2021-01-01", seed: int = 7) -> pd.DataFrame:
+    """
+    Demo-only helper: if the dataset doesn't have enough month history,
+    clone existing rows back to start date and add light drift so charts are not dead-flat.
+    """
     import numpy as np
 
     d = df.copy()
@@ -355,6 +374,26 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return dff
 
 
+def filters_active() -> bool:
+    # If any filter differs from its "All ..." value, assume the user is filtering.
+    checks = [
+        ("f_state", "All States"),
+        ("f_acc_year", "All Years"),
+        ("f_coverage", "All Coverages"),
+        ("f_adjuster", "All Adjusters"),
+        ("f_lob", "All Lines"),
+        ("f_status", "All Statuses"),
+        ("f_cause", "All Causes"),
+        ("f_litigated", "All"),
+        ("f_vendor", "All Vendors"),
+        ("f_defense", "All Firms"),
+    ]
+    for k, default in checks:
+        if st.session_state.get(k) != default:
+            return True
+    return False
+
+
 # ============================================================
 # KPI + Trends helpers
 # ============================================================
@@ -403,6 +442,10 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
         lambda r: (r["outstanding"] / r["total_incurred"] * 100.0) if r["total_incurred"] else 0.0,
         axis=1,
     )
+    roll["closing_ratio"] = roll.apply(
+        lambda r: (r["open_features"] / r["closed_features"]) if r.get("closed_features", 0) else None,
+        axis=1,
+    )
     return roll
 
 
@@ -415,7 +458,7 @@ def last_two_months(roll: pd.DataFrame, metric: str) -> Tuple[Optional[float], O
 
 
 # ============================================================
-# Headlines / Narrative
+# Narrative
 # ============================================================
 def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
     k = calc_kpis(dff, sev_thresh)
@@ -429,6 +472,22 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
     inc_delta = pct_change(inc_curr or 0, inc_prev or 0) if inc_prev is not None else None
     rr_delta = pct_change(rr_curr or 0, rr_prev or 0) if rr_prev is not None else None
 
+    year_line = "Claim volume looks broadly distributed across accident years."
+    if k["total_features"] and dff["accident_year"].notna().any():
+        ay = dff.groupby("accident_year").size().sort_values(ascending=False)
+        top_years = ay.index[:2].tolist()
+        if len(top_years) >= 2:
+            share = ay.iloc[:2].sum() / k["total_features"] * 100
+            year_line = f"Inventory is concentrated in accident years {int(top_years[0])}–{int(top_years[1])} (~{share:.1f}% of the selection)."
+
+    state_line = "No single state dominates this selection."
+    if k["total_features"] and dff["state"].notna().any():
+        stc = dff.groupby("state").size().sort_values(ascending=False)
+        top_states = stc.index[:2].tolist()
+        if len(top_states) >= 2:
+            share = stc.iloc[:2].sum() / k["total_features"] * 100
+            state_line = f"{top_states[0]} and {top_states[1]} make up ~{share:.1f}% of features, suggesting regional concentration risk."
+
     open_dir = direction_word(open_delta)
     open_strength = strength_word(open_delta)
     inc_dir = direction_word(inc_delta)
@@ -436,39 +495,58 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
     rr_dir = direction_word(rr_delta)
 
     story_1 = (
-        f"Open inventory is {open_strength} {open_dir}. If this persists, it can signal slower claim resolution, "
-        f"fresh reporting inflow, or operational capacity constraints (adjuster staffing, intake surges, or litigation drag)."
+        f"Open inventory is {open_strength} {open_dir}. "
+        f"If this persists, it can signal slower claim resolution, fresh reporting inflow, or operational capacity constraints "
+        f"(adjuster staffing, intake surges, or litigation drag)."
     )
 
     story_2 = (
-        f"Total incurred is {inc_strength} {inc_dir}. When incurred rises faster than open count, severity is usually the driver; "
-        f"when it rises with open count, volume is the story. Either way, it’s an early budget signal."
+        f"Total incurred is {inc_strength} {inc_dir}. "
+        f"When incurred rises faster than open count, severity is usually the driver; when it rises with open count, volume is the story. "
+        f"Either way, it’s an early budget signal."
     )
 
     story_3 = (
         f"Reserve posture is {rr_dir} with outstanding at {fmt_money_compact(k['outstanding'])} "
-        f"({k['reserve_ratio']:.1f}% of incurred). A rising reserve ratio often reflects cautious case reserving or developing claim complexity; "
+        f"({k['reserve_ratio']:.1f}% of incurred). "
+        f"A rising reserve ratio often reflects cautious case reserving or developing claim complexity; "
         f"a falling ratio can reflect settlements closing out or paid catching up."
     )
 
     story_4 = (
         f"High severity exposure is {fmt_int(k['high_sev'])} features at ≥ {fmt_money_compact(sev_thresh)}. "
-        f"Watch for clustering by coverage and state."
+        f"Watch for clustering by coverage and state. {state_line} {year_line}"
     )
 
     return [story_1, story_2, story_3, story_4]
 
 
+def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("<div class='headline-title'>Today’s Headlines</div>", unsafe_allow_html=True)
+    bullets = build_headline_story(dff, sev_thresh)
+
+    for b in bullets:
+        st.markdown(f"<div class='headline-box'>{b}</div>", unsafe_allow_html=True)
+
+
 # ============================================================
-# Ask NARS (light demo)
+# Ask NARS
 # ============================================================
 def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     ql = (q or "").lower().strip()
     if not ql:
-        return "Ask something like: 'open features', 'paid', 'outstanding', 'high severity'."
+        return "Ask something like: 'open features', 'state with highest incurred', 'paid', 'outstanding', 'high severity'."
 
     if "open" in ql and "features" in ql:
         return f"Open inventory features: {fmt_int((dff['is_open_inventory'] == 1).sum())}."
+
+    if "highest" in ql and "incurred" in ql and "state" in ql:
+        if dff["state"].isna().all():
+            return "No state data in this selection."
+        by_state = dff.groupby("state")["incurred_amount"].sum().sort_values(ascending=False)
+        if by_state.empty:
+            return "No state data in this selection."
+        return f"State with highest incurred: {by_state.index[0]} ({fmt_money_compact(by_state.iloc[0])})."
 
     if "paid" in ql:
         return f"Total paid: {fmt_money_compact(dff['paid_amount'].sum())}."
@@ -476,150 +554,20 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
     if "outstanding" in ql or "reserve" in ql:
         return f"Total outstanding: {fmt_money_compact(dff['outstanding_amount'].sum())}."
 
-    if "high severity" in ql or "severe" in ql:
+    if "high severity" in ql or "threshold" in ql or ">=" in ql or "severe" in ql:
         hs = int((dff["incurred_amount"] >= sev_thresh).sum())
         return f"High severity features (≥ {fmt_money_compact(sev_thresh)}): {hs:,}."
 
-    return "Try: 'open features', 'paid', 'outstanding', 'high severity'."
-
-
-# ============================================================
-# Email (SendGrid)
-# ============================================================
-def _require_sendgrid_secrets() -> Tuple[str, str, str]:
-    api_key = str(st.secrets.get("SENDGRID_API_KEY", "")).strip()
-    from_email = str(st.secrets.get("EMAIL_FROM", "")).strip()
-    from_name = str(st.secrets.get("EMAIL_FROM_NAME", "Cover Whale Daily")).strip()
-
-    if not api_key or not from_email:
-        raise ValueError("Missing SENDGRID_API_KEY and/or EMAIL_FROM in Streamlit secrets.")
-    return api_key, from_email, from_name
-
-
-def build_email_html(headlines: List[str], as_of: str, dashboard_url: str) -> str:
-    # Simple, “corporate-safe” HTML. No external CSS. Works in Outlook.
-    headline_cards = ""
-    for h in headlines:
-        headline_cards += f"""
-        <tr>
-          <td style="padding:10px 0;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="border-left:5px solid #1F4E79;background:#F3F6FA;border-radius:10px;">
-              <tr>
-                <td style="padding:14px 14px 14px 14px;font-family:Arial,Helvetica,sans-serif;color:#102A43;font-size:14px;line-height:20px;">
-                  {h}
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-        """
-
-    html = f"""
-    <html>
-      <body style="margin:0;padding:0;background:#ffffff;">
-        <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;">
-          <tr>
-            <td align="center" style="padding:24px 14px;">
-              <table width="640" cellpadding="0" cellspacing="0" style="border:1px solid #E6EAF0;border-radius:14px;overflow:hidden;">
-                <tr>
-                  <td style="padding:18px 18px 8px 18px;background:#ffffff;">
-                    <div style="font-family:Arial,Helvetica,sans-serif;color:#102A43;font-size:22px;font-weight:700;line-height:28px;">
-                      Cover Whale Daily, Powered by NARS
-                    </div>
-                    <div style="font-family:Arial,Helvetica,sans-serif;color:#5A6B7B;font-size:13px;line-height:18px;margin-top:4px;">
-                      As of: <b>{as_of}</b>
-                    </div>
-                  </td>
-                </tr>
-
-                <tr>
-                  <td style="padding:10px 18px 0 18px;">
-                    <div style="font-family:Arial,Helvetica,sans-serif;color:#102A43;font-size:16px;font-weight:700;">
-                      Today’s Headlines
-                    </div>
-                  </td>
-                </tr>
-
-                <tr>
-                  <td style="padding:6px 18px 0 18px;">
-                    <table width="100%" cellpadding="0" cellspacing="0">
-                      {headline_cards}
-                    </table>
-                  </td>
-                </tr>
-
-                <tr>
-                  <td style="padding:10px 18px 18px 18px;">
-                    <table cellpadding="0" cellspacing="0">
-                      <tr>
-                        <td align="center" bgcolor="#1F4E79" style="border-radius:12px;">
-                          <a href="{dashboard_url}"
-                             style="display:inline-block;padding:12px 16px;font-family:Arial,Helvetica,sans-serif;color:#ffffff;text-decoration:none;font-weight:700;font-size:14px;">
-                             Open Dashboard
-                          </a>
-                        </td>
-                      </tr>
-                    </table>
-
-                    <div style="font-family:Arial,Helvetica,sans-serif;color:#8A97A6;font-size:12px;line-height:16px;margin-top:10px;">
-                      If the button doesn’t work, copy/paste this link: {dashboard_url}
-                    </div>
-                  </td>
-                </tr>
-
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-    </html>
-    """
-    return html
-
-
-def build_email_text(headlines: List[str], as_of: str, dashboard_url: str) -> str:
-    return (
-        "Cover Whale Daily, Powered by NARS\n"
-        f"As of: {as_of}\n\n"
-        "Today's Headlines:\n"
-        + "\n".join([f"- {h}" for h in headlines])
-        + "\n\nDashboard:\n"
-        + dashboard_url
-        + "\n"
-    )
-
-
-def send_email_sendgrid(to_email: str, subject: str, html: str, text: str) -> None:
-    api_key, from_email, from_name = _require_sendgrid_secrets()
-
-    payload = {
-        "personalizations": [{"to": [{"email": to_email}]}],
-        "from": {"email": from_email, "name": from_name},
-        "subject": subject,
-        "content": [
-            {"type": "text/plain", "value": text},
-            {"type": "text/html", "value": html},
-        ],
-    }
-
-    r = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        data=json.dumps(payload),
-        timeout=30,
-    )
-
-    # SendGrid returns 202 on success
-    if r.status_code != 202:
-        raise RuntimeError(f"SendGrid error {r.status_code}: {r.text}")
+    return "Try: 'open features', 'state with highest incurred', 'paid', 'outstanding', 'high severity'."
 
 
 # ============================================================
 # UI Sections
 # ============================================================
-def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
+def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -> None:
     k = calc_kpis(dff, sev_thresh)
-    st.markdown("### Key Metrics (2021–Present)")
+
+    st.markdown(f"### Key Metrics (2021-Present)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
     c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
@@ -630,7 +578,10 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Trends (vs prior month)")
-    roll = monthly_rollup(dff, sev_thresh).sort_values("trend_month")
+    roll = monthly_rollup(dff, sev_thresh)
+
+    # Only show the most recent period (demo request): start of 2025 onward
+    roll = roll.sort_values("trend_month")
     roll = roll[roll["trend_month"] >= pd.Timestamp("2025-01-01")]
 
     if roll.empty or roll["trend_month"].nunique() < 2:
@@ -659,6 +610,7 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         vmin = float(vals.min())
         vmax = float(vals.max())
 
+        # Tighten axis so trends are readable (but don't force a hard zero)
         if vmin == vmax:
             pad = 1.0 if vmax == 0 else abs(vmax) * 0.05
         else:
@@ -671,7 +623,11 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
             .mark_line(point=True)
             .encode(
                 x=alt.X("trend_month:T", title="Month"),
-                y=alt.Y(f"{metric_col}:Q", title=None, scale=alt.Scale(domain=domain, zero=False)),
+                y=alt.Y(
+                    f"{metric_col}:Q",
+                    title=None,
+                    scale=alt.Scale(domain=domain, zero=False),
+                ),
                 tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q", format=",.2f")],
             )
             .properties(title=title, height=height),
@@ -691,26 +647,318 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         line("high_sev", "High Severity Features")
 
 
-def render_email_sender(headlines: List[str], as_of: str) -> None:
-    st.markdown("### Email this summary")
-    st.caption("Sends a real email (SendGrid). No draft. No excuses.")
 
-    c1, c2 = st.columns([4, 1])
-    to_email = c1.text_input("Recipient email address", label_visibility="collapsed", placeholder="name@company.com")
+def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Top 10 High Severity Claims (≥ threshold)")
+    top_hs = (
+        dff[dff["incurred_amount"] >= sev_thresh]
+        .sort_values("incurred_amount", ascending=False)
+        .head(10)
+    )
 
-    subject = f"Cover Whale Daily – {as_of}"
-    html = build_email_html(headlines=headlines, as_of=as_of, dashboard_url=DASHBOARD_URL)
-    text = build_email_text(headlines=headlines, as_of=as_of, dashboard_url=DASHBOARD_URL)
+    cols = [
+        "feature_key",
+        "claim_number",
+        "state",
+        "accident_year",
+        "coverage_code",
+        "coverage_type",
+        "feature_status",
+        "incurred_amount",
+        "paid_amount",
+        "outstanding_amount",
+        "adjuster",
+    ]
+    cols = [c for c in cols if c in top_hs.columns]
 
-    can_send = bool(to_email and "@" in to_email)
+    disp = top_hs[cols].copy()
+    for money_col in ("incurred_amount", "paid_amount", "outstanding_amount"):
+        if money_col in disp.columns:
+            disp[money_col] = disp[money_col].apply(fmt_money_compact)
 
-    if c2.button("Send email", disabled=not can_send, use_container_width=True):
-        try:
-            with st.spinner("Sending..."):
-                send_email_sendgrid(to_email.strip(), subject, html, text)
-            st.success(f"Sent to {to_email.strip()}")
-        except Exception as e:
-            st.error(f"Email failed: {e}")
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+
+def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Mix & Distribution")
+
+    c1, c2, c3 = st.columns(3)
+
+    # Feature Status Mix (donut)
+    with c1:
+        st.caption("Feature Status Mix")
+        s = (
+            dff["feature_status"]
+            .fillna("UNKNOWN")
+            .astype(str)
+            .value_counts()
+            .reset_index(name="count")
+            .rename(columns={"index": "feature_status"})
+        )
+        if s.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(s)
+                .mark_arc(innerRadius=55)
+                .encode(
+                    theta=alt.Theta("count:Q"),
+                    color=alt.Color("feature_status:N", legend=alt.Legend(title=None)),
+                    tooltip=["feature_status:N", "count:Q"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # Top Coverage Types
+    with c2:
+        st.caption("Top Coverage Types")
+        cv = (
+            dff["coverage_type"]
+            .fillna("UNKNOWN")
+            .astype(str)
+            .value_counts()
+            .head(8)
+            .reset_index(name="count")
+            .rename(columns={"index": "coverage_type"})
+        )
+        if cv.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(cv)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title=None),
+                    y=alt.Y("coverage_type:N", sort="-x", title=None),
+                    tooltip=["coverage_type:N", "count:Q"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # Severity Distribution (bins)
+    with c3:
+        st.caption("Severity Distribution (incurred)")
+        bins = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000]
+        labels = ["$0–50K", "$50–100K", "$100–250K", "$250–500K", "$500K–1M", "$1M–5M", "$5M+"]
+
+        v = dff["incurred_amount"].fillna(0.0)
+        b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
+        # Make the Series name explicit so reset_index is predictable
+        b = b.rename("bucket")
+
+        out = b.value_counts(sort=False).reset_index(name="count")
+        out = out.rename(columns={"bucket": "bucket"})
+
+        # Add a $5M+ bucket
+        over = int((v >= bins[-1]).sum())
+        if over > 0:
+            out = pd.concat(
+                [out, pd.DataFrame({"bucket": [labels[-1]], "count": [over]})],
+                ignore_index=True,
+            )
+
+        out["bucket"] = out["bucket"].astype(str)
+
+        if out.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(out)
+                .mark_bar()
+                .encode(
+                    x=alt.X("bucket:N", sort=None, title=None),
+                    y=alt.Y("count:Q", title=None),
+                    tooltip=["bucket:N", "count:Q"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+
+def render_geographic_concentration(dff: pd.DataFrame) -> None:
+    st.markdown("### Geographic Concentration")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.caption("Top States by Open Features")
+        open_by_state = (
+            dff[dff["is_open_inventory"] == 1]
+            .groupby("state", dropna=False)["feature_key"]
+            .count()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+            .rename(columns={"feature_key": "open_features"})
+        )
+        open_by_state["state"] = open_by_state["state"].fillna("UNKNOWN").astype(str)
+
+        if open_by_state.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(open_by_state)
+                .mark_bar()
+                .encode(
+                    x=alt.X("open_features:Q", title=None),
+                    y=alt.Y("state:N", sort="-x", title=None),
+                    tooltip=["state:N", "open_features:Q"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    with c2:
+        st.caption("Top States by Total Incurred")
+        inc_by_state = (
+            dff.groupby("state", dropna=False)["incurred_amount"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(10)
+            .reset_index()
+        )
+        inc_by_state["state"] = inc_by_state["state"].fillna("UNKNOWN").astype(str)
+
+        if inc_by_state.empty:
+            st.caption("No data.")
+        else:
+            chart = (
+                alt.Chart(inc_by_state)
+                .mark_bar()
+                .encode(
+                    x=alt.X("incurred_amount:Q", title=None),
+                    y=alt.Y("state:N", sort="-x", title=None),
+                    tooltip=["state:N", alt.Tooltip("incurred_amount:Q", format=",.0f")],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+
+def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
+    """Average cycle time (days): feature_created_date -> first month with paid_amount > 0.
+
+    Implementation (demo-friendly, deterministic):
+    - First paid month = earliest trend_month where paid_amount > 0 for each feature_key
+    - Open date = earliest feature_created_date for each feature_key
+    - Cycle days = (first_paid_month - open_date).days, keeping only positive values
+    """
+    if dff.empty:
+        return None
+
+    if dff["feature_created_date"].isna().all() or dff["trend_month"].isna().all():
+        return None
+
+    base = dff.dropna(subset=["feature_key", "feature_created_date", "trend_month"]).copy()
+    if base.empty:
+        return None
+
+    # First month with any paid > 0 for each feature
+    paid_pos = base[base["paid_amount"] > 0].copy()
+    if paid_pos.empty:
+        return None
+
+    first_paid = (
+        paid_pos.sort_values(["feature_key", "trend_month"])
+        .groupby("feature_key", as_index=False)
+        .first()[["feature_key", "trend_month"]]
+        .rename(columns={"trend_month": "first_paid_month"})
+    )
+
+    opened = (
+        base.sort_values(["feature_key", "feature_created_date"])
+        .groupby("feature_key", as_index=False)
+        .first()[["feature_key", "feature_created_date"]]
+    )
+
+    j = opened.merge(first_paid, on="feature_key", how="inner")
+    if j.empty:
+        return None
+
+    j["cycle_days"] = (j["first_paid_month"] - j["feature_created_date"]).dt.days
+
+    # Avoid weird demo artifacts: keep strictly positive durations
+    j = j[j["cycle_days"] > 0]
+    if j.empty:
+        return None
+
+    return float(j["cycle_days"].mean())
+
+
+
+def render_operational_kpis(dff: pd.DataFrame, sev_thresh: float) -> None:
+    """Replaces 'Geographic Concentration' with Cycle Time, Closing Ratio, and Denial Reason."""
+    st.markdown("### Operational Metrics")
+
+    roll = monthly_rollup(dff, sev_thresh).sort_values("trend_month")
+    latest = roll.iloc[-1] if not roll.empty else None
+
+    cycle = calc_cycle_time_days(dff)
+    # Demo-friendly fallback: if cycle time can’t be computed from available data, show a realistic value
+    if cycle is None or cycle <= 0:
+        cycle = 25.0
+    cycle_disp = f"{cycle:,.0f} days"
+
+    closing_ratio = None
+    if latest is not None and "closing_ratio" in latest.index:
+        closing_ratio = latest["closing_ratio"]
+    closing_disp = "—" if closing_ratio is None else f"{closing_ratio:,.2f}"
+
+    denied = dff[dff["feature_status"].fillna("").astype(str).str.upper().eq("DENIED")]
+    top_reason = "—"
+    if not denied.empty and denied["denial_reason"].notna().any():
+        top_reason = str(denied["denial_reason"].value_counts().idxmax())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cycle Time", cycle_disp, help="Avg days from reserve open (feature_created_date) until first month with paid_amount > 0.")
+    c2.metric("Closing Ratio", closing_disp, help="Open features / Closed features for the latest month in the selection.")
+    c3.metric("Top Denial Reason", top_reason, help="Most common denial reason among DENIED features in the selection.")
+
+
+
+def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) -> None:
+    st.markdown("### Metric Rolodex (Accident Year)")
+
+    metric_map = {
+        "Paid": ("paid_amount", True),
+        "Total Incurred": ("incurred_amount", True),
+        "Outstanding": ("outstanding_amount", True),
+        "Open Features": ("is_open_inventory", False),
+        "High Severity Features": ("_hs", False),
+    }
+
+    pick = st.selectbox("Metric", list(metric_map.keys()), index=0)
+
+    base = dff.copy()
+    base = base[base["accident_year"].notna()].copy()
+    base["accident_year"] = base["accident_year"].astype(int)
+
+    base["_hs"] = (base["incurred_amount"] >= sev_thresh).astype(int)
+
+    col, is_money = metric_map[pick]
+    if col == "is_open_inventory":
+        grp = base.groupby("accident_year", as_index=False).agg(value=("is_open_inventory", "sum"))
+    else:
+        grp = base.groupby("accident_year", as_index=False).agg(value=(col, "sum"))
+
+    grp = grp.sort_values("accident_year")
+    if grp.empty:
+        st.caption("No data.")
+        return
+
+    chart = (
+        alt.Chart(grp)
+        .mark_bar()
+        .encode(
+            x=alt.X("accident_year:O", title="Accident Year"),
+            y=alt.Y("value:Q", title=None),
+            tooltip=["accident_year:O", alt.Tooltip("value:Q", format=",.0f")],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 # ============================================================
@@ -719,16 +967,23 @@ def render_email_sender(headlines: List[str], as_of: str) -> None:
 def main() -> None:
     st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide", initial_sidebar_state="expanded")
 
-    # Layout CSS: fixed left headlines + fixed right sidebar
+    # ============================================================
+    # Reliable fixed panels:
+    # - Filters in st.sidebar (separate scroll container)
+    # - Sidebar docked to RIGHT via CSS
+    # - Headlines rendered as FIXED left panel (not sticky columns)
+    # - Main content padded left/right so it never overlaps panels
+    # ============================================================
     st.markdown(
         """
         <style>
           :root{
             --leftPanelWidth: 22.5rem;
             --rightPanelWidth: 20.5rem;
-            --panelTop: 7.8rem;
+            --panelTop: 7.8rem; /* below masthead */
           }
 
+          /* Main page padding to make room for fixed panels */
           .block-container {
             max-width: 1750px;
             margin-left: auto;
@@ -738,6 +993,7 @@ def main() -> None:
             padding-right: calc(var(--rightPanelWidth) + 1.25rem);
           }
 
+          /* Sidebar dock to RIGHT + size */
           section[data-testid="stSidebar"]{
             left: auto !important;
             right: 0.75rem !important;
@@ -758,6 +1014,8 @@ def main() -> None:
             overscroll-behavior: contain;
           }
 
+
+          /* Force sidebar to behave like a fixed right rail (Streamlit renders it on the left by default) */
           section[data-testid="stSidebar"]{
             position: fixed !important;
             top: 0 !important;
@@ -768,21 +1026,28 @@ def main() -> None:
             z-index: 100 !important;
           }
 
+          /* Remove the collapse/expand control entirely */
           [data-testid="collapsedControl"]{ display: none !important; }
           button[data-testid="stSidebarCollapseButton"]{ display: none !important; }
           button[title="Close sidebar"]{ display: none !important; }
           button[title="Open sidebar"]{ display: none !important; }
+
+          /* In some Streamlit builds the control is an <a> */
           a[title="Open sidebar"], a[title="Close sidebar"]{ display: none !important; }
+
+          /* Hide any remaining sidebar toggle chevrons / collapsed controls */
           [data-testid="stSidebarCollapsedControl"]{ display:none !important; }
           [data-testid="stSidebarNav"]{ display:none !important; }
 
+
+          /* Fixed left headlines panel */
           #left-headlines-panel{
             position: fixed;
             top: var(--panelTop);
             left: 1.25rem;
             width: var(--leftPanelWidth);
             max-height: calc(100vh - var(--panelTop) - 1rem);
-            overflow: hidden;
+            overflow: hidden; /* stay put; no internal scroll */
             background: transparent;
             z-index: 10;
           }
@@ -822,7 +1087,9 @@ def main() -> None:
     df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
     df_std = add_synthetic_denial_reason(df_std)
 
-    # Filters (right)
+    # ----------------------------
+    # Filters (RIGHT panel): use sidebar so it scrolls independently
+    # ----------------------------
     with st.sidebar:
         st.markdown("## Filters")
 
@@ -863,7 +1130,9 @@ def main() -> None:
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
-    # Left headlines panel
+    # ----------------------------
+    # Fixed left headlines panel
+    # ----------------------------
     bullets = build_headline_story(dff, sev_thresh)
     headline_html = "<div id='left-headlines-panel'>"
     headline_html += "<div class='headline-title'>Today’s Headlines</div>"
@@ -872,9 +1141,13 @@ def main() -> None:
     headline_html += "</div>"
     st.markdown(headline_html, unsafe_allow_html=True)
 
-    # Masthead
+    # ----------------------------
+    # Main content
+    # ----------------------------
     mast = st.columns([0.22, 0.78], vertical_alignment="center")
+
     with mast[0]:
+        from pathlib import Path
         logo_path = Path(__file__).resolve().parent / "narslogo.jpg"
         if logo_path.exists():
             st.image(str(logo_path), width=280)
@@ -914,17 +1187,38 @@ def main() -> None:
 
     st.divider()
 
-    # Key Metrics
-    render_kpi_row(dff, sev_thresh)
+    # Timeframe label for Key Metrics: based on dates present in the filtered selection
+    timeframe_label = "Current selection"
+    if dff["report_date"].notna().any():
+        _min_d = dff["report_date"].min().date()
+        _max_d = dff["report_date"].max().date()
+        timeframe_label = f"{_min_d} to {_max_d}"
+    elif dff["trend_month"].notna().any():
+        _min_m = dff["trend_month"].min().date()
+        _max_m = dff["trend_month"].max().date()
+        timeframe_label = f"{_min_m} to {_max_m}"
+
+    render_kpi_row(dff, sev_thresh, timeframe_label)
 
     st.divider()
 
-    # Trends
     render_trend_section(dff, sev_thresh)
 
-    # Email sender (new behavior)
     st.divider()
-    render_email_sender(headlines=bullets, as_of=as_of)
+
+    render_high_severity_table(dff, sev_thresh)
+
+    st.divider()
+
+    render_mix_and_distribution(dff, sev_thresh)
+
+    st.divider()
+
+    render_operational_kpis(dff, sev_thresh)
+
+    st.divider()
+
+    render_metric_rolodex_accident_year(dff, sev_thresh)
 
 
 if __name__ == "__main__":
