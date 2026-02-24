@@ -603,14 +603,17 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
 
     st.divider()
 
-    def line(metric_col: str, title: str) -> None:
-        vals = roll[metric_col].astype(float)
+    def line(metric_col: str, title: str, height: int = 340) -> None:
+        vals = pd.to_numeric(roll[metric_col], errors="coerce").fillna(0.0)
         vmin = float(vals.min())
         vmax = float(vals.max())
+
+        # Tighten axis so trends are readable (but don't lie with a hard zero)
         if vmin == vmax:
             pad = 1.0 if vmax == 0 else abs(vmax) * 0.05
         else:
-            pad = (vmax - vmin) * 0.08
+            pad = (vmax - vmin) * 0.10
+
         domain = [vmin - pad, vmax + pad]
 
         st.altair_chart(
@@ -623,15 +626,22 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
                     title=None,
                     scale=alt.Scale(domain=domain, zero=False),
                 ),
-                tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q")],
+                tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q", format=",.2f")],
             )
-            .properties(title=title, height=220),
+            .properties(title=title, height=height),
             use_container_width=True,
         )
 
+    # If Open Features is truly flat, skip the chart (still shown as KPI above and in Rolodex).
+    show_open_chart = roll["open_features"].nunique(dropna=False) > 1
+
     r1 = st.columns(3)
     with r1[0]:
-        line("open_features", "Open Features")
+        if show_open_chart:
+            line("open_features", "Open Features")
+        else:
+            st.caption("Open Features")
+            st.info("Open Features are flat across months in this selection, so the chart is hidden.")
     with r1[1]:
         line("total_incurred", "Total Incurred ($)")
     with r1[2]:
@@ -642,6 +652,7 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         line("outstanding", "Outstanding ($)")
     with r2[1]:
         line("high_sev", "High Severity Features")
+
 
 
 def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
@@ -688,8 +699,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .fillna("UNKNOWN")
             .astype(str)
             .value_counts()
-            .reset_index()
-            .rename(columns={"index": "feature_status", "feature_status": "count"})
+            .reset_index(name="count")
+            .rename(columns={"index": "feature_status"})
         )
         if s.empty:
             st.caption("No data.")
@@ -702,7 +713,7 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                     color=alt.Color("feature_status:N", legend=alt.Legend(title=None)),
                     tooltip=["feature_status:N", "count:Q"],
                 )
-                .properties(height=240)
+                .properties(height=260)
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -715,8 +726,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .astype(str)
             .value_counts()
             .head(8)
-            .reset_index()
-            .rename(columns={"index": "coverage_type", "coverage_type": "count"})
+            .reset_index(name="count")
+            .rename(columns={"index": "coverage_type"})
         )
         if cv.empty:
             st.caption("No data.")
@@ -729,7 +740,7 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                     y=alt.Y("coverage_type:N", sort="-x", title=None),
                     tooltip=["coverage_type:N", "count:Q"],
                 )
-                .properties(height=240)
+                .properties(height=260)
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -740,10 +751,12 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
         labels = ["$0–50K", "$50–100K", "$100–250K", "$250–500K", "$500K–1M", "$1M–5M", "$5M+"]
 
         v = dff["incurred_amount"].fillna(0.0)
-        # pd.cut requires len(labels) == len(bins) if include_lowest etc. We'll handle last bin separately.
         b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
-        out = b.value_counts().sort_index().reset_index()
-        out.columns = ["bucket", "count"]
+        # Make the Series name explicit so reset_index is predictable
+        b = b.rename("bucket")
+
+        out = b.value_counts(sort=False).reset_index(name="count")
+        out = out.rename(columns={"bucket": "bucket"})
 
         # Add a $5M+ bucket
         over = int((v >= bins[-1]).sum())
@@ -752,6 +765,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                 [out, pd.DataFrame({"bucket": [labels[-1]], "count": [over]})],
                 ignore_index=True,
             )
+
+        out["bucket"] = out["bucket"].astype(str)
 
         if out.empty:
             st.caption("No data.")
@@ -764,7 +779,7 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                     y=alt.Y("count:Q", title=None),
                     tooltip=["bucket:N", "count:Q"],
                 )
-                .properties(height=240)
+                .properties(height=260)
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -944,7 +959,7 @@ def main() -> None:
         """
         <style>
           :root{
-            --stickyTop: 0.75rem;
+            --stickyTop: 6.0rem; /* keep sticky panels below the masthead */
           }
 
           /* Let sticky children behave correctly */
@@ -963,7 +978,20 @@ def main() -> None:
             padding-right: 0.25rem;
           }
 
-          .block-container { padding-top: 1.0rem; }
+          /* Give the page enough breathing room so the title never gets clipped */
+          .block-container { padding-top: 3.25rem; }
+
+          /* Headlines: readable, separated, consistent */
+          .headline-box{
+            background: #F3F6FA;
+            border-left: 6px solid #1F4E79;
+            padding: 0.85rem 0.9rem;
+            margin: 0.75rem 0;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            line-height: 1.35;
+            color: #102A43;
+          }
         </style>
         """,
         unsafe_allow_html=True,
