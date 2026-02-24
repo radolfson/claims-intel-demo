@@ -564,10 +564,10 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 # ============================================================
 # UI Sections
 # ============================================================
-def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
+def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -> None:
     k = calc_kpis(dff, sev_thresh)
 
-    st.markdown("### Key Metrics")
+    st.markdown(f"### Key Metrics ({timeframe_label})")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
     c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
@@ -577,7 +577,7 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
 
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Trends")
+    st.markdown("### Trends (Month-over-month vs prior month)")
     roll = monthly_rollup(dff, sev_thresh)
 
     # Only show the most recent period (demo request): start of 2025 onward
@@ -601,7 +601,7 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         delta = pct_change(curr or 0, prev or 0) if prev is not None else None
         display_val = fmt_money_compact(curr) if is_money else fmt_int(curr)
         display_delta = None if delta is None else f"{delta:+.1f}%"
-        stat_cols[i].metric(label, display_val, display_delta)
+        stat_cols[i].metric(label, display_val, display_delta, delta_color="off")
 
     st.divider()
 
@@ -1187,7 +1187,18 @@ def main() -> None:
 
     st.divider()
 
-    render_kpi_row(dff, sev_thresh)
+    # Timeframe label for Key Metrics: based on dates present in the filtered selection
+    timeframe_label = "Current selection"
+    if dff["report_date"].notna().any():
+        _min_d = dff["report_date"].min().date()
+        _max_d = dff["report_date"].max().date()
+        timeframe_label = f"{_min_d} to {_max_d}"
+    elif dff["trend_month"].notna().any():
+        _min_m = dff["trend_month"].min().date()
+        _max_m = dff["trend_month"].max().date()
+        timeframe_label = f"{_min_m} to {_max_m}"
+
+    render_kpi_row(dff, sev_thresh, timeframe_label)
 
     st.divider()
 
