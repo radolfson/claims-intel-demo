@@ -567,7 +567,7 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -> None:
     k = calc_kpis(dff, sev_thresh)
 
-    st.markdown(f"### Key Metrics ({timeframe_label})")
+    st.markdown(f"### Key Metrics (2021-Present)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
     c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
@@ -577,7 +577,7 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -
 
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Trends (Month-over-month vs prior month)")
+    st.markdown("### Trends (vs prior month)")
     roll = monthly_rollup(dff, sev_thresh)
 
     # Only show the most recent period (demo request): start of 2025 onward
