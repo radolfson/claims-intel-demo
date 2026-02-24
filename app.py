@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import urllib.parse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import altair as alt
@@ -24,6 +26,9 @@ COVERAGE_CODE_TO_COVERAGE = {
     "WC-IND": "INDEMNITY",
     "CARGO": "CARGO",
 }
+
+# Where your dashboard actually lives (used in email body)
+DASHBOARD_URL = str(st.secrets.get("DASHBOARD_URL", "https://nars-demo.streamlit.app")).strip()
 
 
 @dataclass
@@ -183,7 +188,18 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["trend_month"] = pd.NaT
 
-    for col in ("client", "state", "coverage_type", "feature_status", "adjuster", "line_of_business", "cause_of_loss", "vendor_name", "defense_firm", "denial_reason"):
+    for col in (
+        "client",
+        "state",
+        "coverage_type",
+        "feature_status",
+        "adjuster",
+        "line_of_business",
+        "cause_of_loss",
+        "vendor_name",
+        "defense_firm",
+        "denial_reason",
+    ):
         d[col] = d[col].astype("string")
 
     d["accident_year"] = pd.to_numeric(d["accident_year"], errors="coerce")
@@ -192,11 +208,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
-    """Demo helper: add a denial_reason field only for DENIED features.
-
-    - Keeps the same reason per feature_key deterministically.
-    - Includes 'MCS90' as requested.
-    """
+    """Demo helper: add a denial_reason field only for DENIED features (deterministic). Includes 'MCS90'."""
     reasons = [
         "MCS90",
         "Coverage Exclusion",
@@ -210,13 +222,11 @@ def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
     status = d["feature_status"].fillna("").astype(str).str.upper()
     denied = status.eq("DENIED")
 
-    # Only assign for denied rows; otherwise leave blank so the filter behaves as expected.
     d["denial_reason"] = d.get("denial_reason", pd.Series([None] * len(d)))
     d["denial_reason"] = d["denial_reason"].astype("string")
 
     def pick_reason(fk) -> str:
         s = str(fk) if fk is not None else ""
-        # deterministic hash -> stable bucket
         h = 0
         for ch in s:
             h = (h * 31 + ord(ch)) % 10_000
@@ -225,9 +235,7 @@ def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
     if denied.any():
         d.loc[denied, "denial_reason"] = d.loc[denied, "feature_key"].apply(pick_reason).astype("string")
 
-    # Normalize blanks to NA
     d["denial_reason"] = d["denial_reason"].replace({"": pd.NA})
-
     return d
 
 
@@ -374,26 +382,6 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     return dff
 
 
-def filters_active() -> bool:
-    # If any filter differs from its "All ..." value, assume the user is filtering.
-    checks = [
-        ("f_state", "All States"),
-        ("f_acc_year", "All Years"),
-        ("f_coverage", "All Coverages"),
-        ("f_adjuster", "All Adjusters"),
-        ("f_lob", "All Lines"),
-        ("f_status", "All Statuses"),
-        ("f_cause", "All Causes"),
-        ("f_litigated", "All"),
-        ("f_vendor", "All Vendors"),
-        ("f_defense", "All Firms"),
-    ]
-    for k, default in checks:
-        if st.session_state.get(k) != default:
-            return True
-    return False
-
-
 # ============================================================
 # KPI + Trends helpers
 # ============================================================
@@ -521,14 +509,6 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
     return [story_1, story_2, story_3, story_4]
 
 
-def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("<div class='headline-title'>Today’s Headlines</div>", unsafe_allow_html=True)
-    bullets = build_headline_story(dff, sev_thresh)
-
-    for b in bullets:
-        st.markdown(f"<div class='headline-box'>{b}</div>", unsafe_allow_html=True)
-
-
 # ============================================================
 # Ask NARS
 # ============================================================
@@ -566,8 +546,7 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 # ============================================================
 def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -> None:
     k = calc_kpis(dff, sev_thresh)
-
-    st.markdown(f"### Key Metrics (2021-Present)")
+    st.markdown("### Key Metrics (2021–Present)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
     c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
@@ -580,7 +559,6 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Trends (vs prior month)")
     roll = monthly_rollup(dff, sev_thresh)
 
-    # Only show the most recent period (demo request): start of 2025 onward
     roll = roll.sort_values("trend_month")
     roll = roll[roll["trend_month"] >= pd.Timestamp("2025-01-01")]
 
@@ -610,7 +588,6 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         vmin = float(vals.min())
         vmax = float(vals.max())
 
-        # Tighten axis so trends are readable (but don't force a hard zero)
         if vmin == vmax:
             pad = 1.0 if vmax == 0 else abs(vmax) * 0.05
         else:
@@ -645,7 +622,6 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         line("outstanding", "Outstanding ($)")
     with r2[1]:
         line("high_sev", "High Severity Features")
-
 
 
 def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
@@ -684,7 +660,6 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
 
     c1, c2, c3 = st.columns(3)
 
-    # Feature Status Mix (donut)
     with c1:
         st.caption("Feature Status Mix")
         s = (
@@ -710,7 +685,6 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             )
             st.altair_chart(chart, use_container_width=True)
 
-    # Top Coverage Types
     with c2:
         st.caption("Top Coverage Types")
         cv = (
@@ -737,7 +711,6 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             )
             st.altair_chart(chart, use_container_width=True)
 
-    # Severity Distribution (bins)
     with c3:
         st.caption("Severity Distribution (incurred)")
         bins = [0, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000]
@@ -745,13 +718,11 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
 
         v = dff["incurred_amount"].fillna(0.0)
         b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
-        # Make the Series name explicit so reset_index is predictable
         b = b.rename("bucket")
 
         out = b.value_counts(sort=False).reset_index(name="count")
         out = out.rename(columns={"bucket": "bucket"})
 
-        # Add a $5M+ bucket
         over = int((v >= bins[-1]).sum())
         if over > 0:
             out = pd.concat(
@@ -777,74 +748,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             st.altair_chart(chart, use_container_width=True)
 
 
-def render_geographic_concentration(dff: pd.DataFrame) -> None:
-    st.markdown("### Geographic Concentration")
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.caption("Top States by Open Features")
-        open_by_state = (
-            dff[dff["is_open_inventory"] == 1]
-            .groupby("state", dropna=False)["feature_key"]
-            .count()
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-            .rename(columns={"feature_key": "open_features"})
-        )
-        open_by_state["state"] = open_by_state["state"].fillna("UNKNOWN").astype(str)
-
-        if open_by_state.empty:
-            st.caption("No data.")
-        else:
-            chart = (
-                alt.Chart(open_by_state)
-                .mark_bar()
-                .encode(
-                    x=alt.X("open_features:Q", title=None),
-                    y=alt.Y("state:N", sort="-x", title=None),
-                    tooltip=["state:N", "open_features:Q"],
-                )
-                .properties(height=260)
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-    with c2:
-        st.caption("Top States by Total Incurred")
-        inc_by_state = (
-            dff.groupby("state", dropna=False)["incurred_amount"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-        )
-        inc_by_state["state"] = inc_by_state["state"].fillna("UNKNOWN").astype(str)
-
-        if inc_by_state.empty:
-            st.caption("No data.")
-        else:
-            chart = (
-                alt.Chart(inc_by_state)
-                .mark_bar()
-                .encode(
-                    x=alt.X("incurred_amount:Q", title=None),
-                    y=alt.Y("state:N", sort="-x", title=None),
-                    tooltip=["state:N", alt.Tooltip("incurred_amount:Q", format=",.0f")],
-                )
-                .properties(height=260)
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-
 def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
-    """Average cycle time (days): feature_created_date -> first month with paid_amount > 0.
-
-    Implementation (demo-friendly, deterministic):
-    - First paid month = earliest trend_month where paid_amount > 0 for each feature_key
-    - Open date = earliest feature_created_date for each feature_key
-    - Cycle days = (first_paid_month - open_date).days, keeping only positive values
-    """
+    """Average cycle time (days): feature_created_date -> first month with paid_amount > 0."""
     if dff.empty:
         return None
 
@@ -855,7 +760,6 @@ def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
     if base.empty:
         return None
 
-    # First month with any paid > 0 for each feature
     paid_pos = base[base["paid_amount"] > 0].copy()
     if paid_pos.empty:
         return None
@@ -878,8 +782,6 @@ def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
         return None
 
     j["cycle_days"] = (j["first_paid_month"] - j["feature_created_date"]).dt.days
-
-    # Avoid weird demo artifacts: keep strictly positive durations
     j = j[j["cycle_days"] > 0]
     if j.empty:
         return None
@@ -887,16 +789,13 @@ def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
     return float(j["cycle_days"].mean())
 
 
-
 def render_operational_kpis(dff: pd.DataFrame, sev_thresh: float) -> None:
-    """Replaces 'Geographic Concentration' with Cycle Time, Closing Ratio, and Denial Reason."""
     st.markdown("### Operational Metrics")
 
     roll = monthly_rollup(dff, sev_thresh).sort_values("trend_month")
     latest = roll.iloc[-1] if not roll.empty else None
 
     cycle = calc_cycle_time_days(dff)
-    # Demo-friendly fallback: if cycle time can’t be computed from available data, show a realistic value
     if cycle is None or cycle <= 0:
         cycle = 25.0
     cycle_disp = f"{cycle:,.0f} days"
@@ -917,7 +816,6 @@ def render_operational_kpis(dff: pd.DataFrame, sev_thresh: float) -> None:
     c3.metric("Top Denial Reason", top_reason, help="Most common denial reason among DENIED features in the selection.")
 
 
-
 def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Metric Rolodex (Accident Year)")
 
@@ -934,10 +832,9 @@ def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) ->
     base = dff.copy()
     base = base[base["accident_year"].notna()].copy()
     base["accident_year"] = base["accident_year"].astype(int)
-
     base["_hs"] = (base["incurred_amount"] >= sev_thresh).astype(int)
 
-    col, is_money = metric_map[pick]
+    col, _is_money = metric_map[pick]
     if col == "is_open_inventory":
         grp = base.groupby("accident_year", as_index=False).agg(value=("is_open_inventory", "sum"))
     else:
@@ -962,17 +859,66 @@ def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) ->
 
 
 # ============================================================
+# Email helper (mailto)
+# ============================================================
+def make_mailto(to_email: str, subject: str, body: str) -> str:
+    params = {"subject": subject, "body": body}
+    q = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    return f"mailto:{to_email}?{q}"
+
+
+def render_email_bar(headlines: list[str], as_of: str) -> None:
+    st.markdown("### Email this summary")
+    st.caption("Opens a pre-filled email draft in your default mail client (Outlook/Gmail).")
+
+    # Small, simple bar
+    c1, c2 = st.columns([4, 1])
+    to_email = c1.text_input("Email address", label_visibility="collapsed", placeholder="name@company.com")
+
+    subject = f"Cover Whale Daily (Demo) – {as_of}"
+    body = (
+        "Cover Whale Daily, Powered by NARS\n\n"
+        f"As of: {as_of}\n"
+        f"Dashboard: {DASHBOARD_URL}\n\n"
+        "Today's Headlines:\n"
+        + "\n".join([f"- {h}" for h in headlines])
+        + "\n\n(Automated demo template)\n"
+    )
+
+    if to_email and "@" in to_email:
+        href = make_mailto(to_email.strip(), subject, body)
+        c2.markdown(
+            f"""
+            <a href="{href}" style="
+                display:inline-block;
+                width:100%;
+                text-align:center;
+                padding:0.55rem 0.75rem;
+                border-radius:10px;
+                border:1px solid rgba(49,51,63,0.22);
+                text-decoration:none;
+                font-weight:650;
+                background:#fff;">
+                Open draft
+            </a>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        c2.button("Open draft", disabled=True)
+
+
+# ============================================================
 # Main
 # ============================================================
 def main() -> None:
     st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide", initial_sidebar_state="expanded")
 
     # ============================================================
-    # Reliable fixed panels:
+    # Fixed panels:
     # - Filters in st.sidebar (separate scroll container)
     # - Sidebar docked to RIGHT via CSS
-    # - Headlines rendered as FIXED left panel (not sticky columns)
-    # - Main content padded left/right so it never overlaps panels
+    # - Headlines fixed left panel
     # ============================================================
     st.markdown(
         """
@@ -980,10 +926,9 @@ def main() -> None:
           :root{
             --leftPanelWidth: 22.5rem;
             --rightPanelWidth: 20.5rem;
-            --panelTop: 7.8rem; /* below masthead */
+            --panelTop: 7.8rem;
           }
 
-          /* Main page padding to make room for fixed panels */
           .block-container {
             max-width: 1750px;
             margin-left: auto;
@@ -993,7 +938,6 @@ def main() -> None:
             padding-right: calc(var(--rightPanelWidth) + 1.25rem);
           }
 
-          /* Sidebar dock to RIGHT + size */
           section[data-testid="stSidebar"]{
             left: auto !important;
             right: 0.75rem !important;
@@ -1014,8 +958,6 @@ def main() -> None:
             overscroll-behavior: contain;
           }
 
-
-          /* Force sidebar to behave like a fixed right rail (Streamlit renders it on the left by default) */
           section[data-testid="stSidebar"]{
             position: fixed !important;
             top: 0 !important;
@@ -1026,28 +968,21 @@ def main() -> None:
             z-index: 100 !important;
           }
 
-          /* Remove the collapse/expand control entirely */
           [data-testid="collapsedControl"]{ display: none !important; }
           button[data-testid="stSidebarCollapseButton"]{ display: none !important; }
           button[title="Close sidebar"]{ display: none !important; }
           button[title="Open sidebar"]{ display: none !important; }
-
-          /* In some Streamlit builds the control is an <a> */
           a[title="Open sidebar"], a[title="Close sidebar"]{ display: none !important; }
-
-          /* Hide any remaining sidebar toggle chevrons / collapsed controls */
           [data-testid="stSidebarCollapsedControl"]{ display:none !important; }
           [data-testid="stSidebarNav"]{ display:none !important; }
 
-
-          /* Fixed left headlines panel */
           #left-headlines-panel{
             position: fixed;
             top: var(--panelTop);
             left: 1.25rem;
             width: var(--leftPanelWidth);
             max-height: calc(100vh - var(--panelTop) - 1rem);
-            overflow: hidden; /* stay put; no internal scroll */
+            overflow: hidden;
             background: transparent;
             z-index: 10;
           }
@@ -1088,7 +1023,7 @@ def main() -> None:
     df_std = add_synthetic_denial_reason(df_std)
 
     # ----------------------------
-    # Filters (RIGHT panel): use sidebar so it scrolls independently
+    # Filters (RIGHT panel): sidebar scrolls independently
     # ----------------------------
     with st.sidebar:
         st.markdown("## Filters")
@@ -1142,12 +1077,11 @@ def main() -> None:
     st.markdown(headline_html, unsafe_allow_html=True)
 
     # ----------------------------
-    # Main content
+    # Masthead
     # ----------------------------
     mast = st.columns([0.22, 0.78], vertical_alignment="center")
 
     with mast[0]:
-        from pathlib import Path
         logo_path = Path(__file__).resolve().parent / "narslogo.jpg"
         if logo_path.exists():
             st.image(str(logo_path), width=280)
@@ -1187,7 +1121,7 @@ def main() -> None:
 
     st.divider()
 
-    # Timeframe label for Key Metrics: based on dates present in the filtered selection
+    # Key Metrics
     timeframe_label = "Current selection"
     if dff["report_date"].notna().any():
         _min_d = dff["report_date"].min().date()
@@ -1201,24 +1135,25 @@ def main() -> None:
     render_kpi_row(dff, sev_thresh, timeframe_label)
 
     st.divider()
-
     render_trend_section(dff, sev_thresh)
 
     st.divider()
-
     render_high_severity_table(dff, sev_thresh)
 
     st.divider()
-
     render_mix_and_distribution(dff, sev_thresh)
 
     st.divider()
-
     render_operational_kpis(dff, sev_thresh)
 
     st.divider()
-
     render_metric_rolodex_accident_year(dff, sev_thresh)
+
+    # ----------------------------
+    # Email bar at bottom (mailto)
+    # ----------------------------
+    st.divider()
+    render_email_bar(headlines=bullets, as_of=as_of)
 
 
 if __name__ == "__main__":
