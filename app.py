@@ -967,60 +967,73 @@ def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) ->
 def main() -> None:
     st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide")
 
-    # Sticky side columns (headlines + filters) without covering header/logo
+    # ============================================================
+    # Reliable fixed panels:
+    # - Filters in st.sidebar (separate scroll container)
+    # - Sidebar docked to RIGHT via CSS
+    # - Headlines rendered as FIXED left panel (not sticky columns)
+    # - Main content padded left/right so it never overlaps panels
+    # ============================================================
     st.markdown(
         """
         <style>
           :root{
-            --stickyTop: 6.0rem; /* keep sticky panels below the masthead */
+            --leftPanelWidth: 23rem;
+            --rightPanelWidth: 22rem;
+            --panelTop: 7.0rem; /* below masthead */
           }
 
-          /* Let sticky children behave correctly */
-          div[data-testid="stHorizontalBlock"] { overflow: visible !important; }
-          div[data-testid="stColumn"] { overflow: visible !important; }
-
-          .sticky-col {
-            position: -webkit-sticky;
-            position: sticky;
-            top: var(--stickyTop);
-            align-self: flex-start;
-            background: white;
-            z-index: 2;
-            padding-right: 0.25rem;
+          /* Main page padding to make room for fixed panels */
+          .block-container {
+            padding-top: 3.8rem;
+            padding-left: calc(var(--leftPanelWidth) + 1.25rem);
+            padding-right: calc(var(--rightPanelWidth) + 1.25rem);
           }
 
-          /* Headlines: stay put, no independent scroll (page scroll only) */
-          .sticky-headlines{
-            max-height: none;
-            overflow: visible;
+          /* Sidebar dock to RIGHT + size */
+          section[data-testid="stSidebar"]{
+            left: auto !important;
+            right: 0 !important;
+            width: var(--rightPanelWidth) !important;
+            min-width: var(--rightPanelWidth) !important;
+            max-width: var(--rightPanelWidth) !important;
+            border-left: 1px solid rgba(49,51,63,0.15);
           }
-
-          /* Filters: stay put AND scroll internally without dragging the page */
-          .sticky-filters{
-            max-height: calc(100vh - var(--stickyTop) - 1rem);
+          section[data-testid="stSidebar"] > div{
+            height: 100vh;
             overflow-y: auto;
             overscroll-behavior: contain;
           }
-/* Give the page enough breathing room so the title never gets clipped */
-          .block-container { padding-top: 4.5rem; }
 
-          /* Headlines: readable, separated, consistent */
+          /* Fixed left headlines panel */
+          #left-headlines-panel{
+            position: fixed;
+            top: var(--panelTop);
+            left: 1.0rem;
+            width: var(--leftPanelWidth);
+            max-height: calc(100vh - var(--panelTop) - 1rem);
+            overflow: hidden; /* stay put; no internal scroll */
+            background: transparent;
+            z-index: 10;
+          }
+
           .headline-title{
-            font-size: 1.25rem;
-            font-weight: 700;
-            margin: 0.25rem 0 0.75rem 0;
+            font-size: 1.35rem;
+            font-weight: 800;
+            margin: 0.25rem 0 0.85rem 0;
             color: #102A43;
           }
 
           .headline-box{
             background: #F3F6FA;
             border-left: 6px solid #1F4E79;
-            padding: 0.85rem 0.9rem;
-            margin: 0.75rem 0;
-            border-radius: 10px;
-            font-size: 1.05rem;
-            line-height: 1.5;
+            padding: 1.05rem 1.0rem;
+            margin: 0.85rem 0;
+            border-radius: 12px;
+            font-size: 1.08rem;
+            line-height: 1.55;
             color: #102A43;
+            box-shadow: 0 1px 0 rgba(16,42,67,0.06);
           }
         </style>
         """,
@@ -1039,12 +1052,11 @@ def main() -> None:
     df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
     df_std = add_synthetic_denial_reason(df_std)
 
-    ribbon_col, main_col, filter_col = st.columns([1.25, 3.2, 1.25], gap="large")
-
-    # Filters (right sticky)
-    with filter_col:
-        st.markdown('<div class="sticky-col sticky-filters">', unsafe_allow_html=True)
-        st.markdown("### Filters")
+    # ----------------------------
+    # Filters (RIGHT panel): use sidebar so it scrolls independently
+    # ----------------------------
+    with st.sidebar:
+        st.markdown("## Filters")
 
         states = ["All States"] + safe_list(df_std["state"])
         years = ["All Years"] + [str(int(y)) for y in safe_list(df_std["accident_year"]) if pd.notna(y)]
@@ -1079,87 +1091,88 @@ def main() -> None:
 
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
-        st.markdown("</div>", unsafe_allow_html=True)
 
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
-    # Headlines ribbon (left sticky)
-    with ribbon_col:
-        st.markdown('<div class="sticky-col sticky-headlines">', unsafe_allow_html=True)
-        render_headlines_ribbon(dff, sev_thresh)
-        st.markdown("</div>", unsafe_allow_html=True)
+    # ----------------------------
+    # Fixed left headlines panel
+    # ----------------------------
+    bullets = build_headline_story(dff, sev_thresh)
+    headline_html = "<div id='left-headlines-panel'>"
+    headline_html += "<div class='headline-title'>Today’s Headlines</div>"
+    for b in bullets:
+        headline_html += f"<div class='headline-box'>{b}</div>"
+    headline_html += "</div>"
+    st.markdown(headline_html, unsafe_allow_html=True)
 
+    # ----------------------------
     # Main content
-    with main_col:
-        # Newspaper-style masthead (aligned left within main content)
-        mast = st.columns([0.22, 0.78], vertical_alignment="center")
+    # ----------------------------
+    mast = st.columns([0.22, 0.78], vertical_alignment="center")
 
-        with mast[0]:
-            logo_path = "narslogo.jpg"
-            if os.path.exists(logo_path):
-                # Make the logo the visual anchor (taller than the title)
-                st.image(logo_path, width=260)
+    with mast[0]:
+        from pathlib import Path
+        logo_path = Path(__file__).resolve().parent / "narslogo.jpg"
+        if logo_path.exists():
+            st.image(str(logo_path), width=280)
 
-        with mast[1]:
-            st.markdown(
-                """
-                <div style="line-height:1.10; padding-top:10px;">
-                  <div style="font-size:32px; font-weight:650; letter-spacing:0.3px;">
-                    Cover Whale Daily, Powered by NARS
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    with mast[1]:
+        st.markdown(
+            """
+            <div style="line-height:1.05; padding-top:6px;">
+              <div style="font-size:30px; font-weight:650; letter-spacing:0.25px;">
+                Cover Whale Daily, Powered by NARS
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-            as_of = "Latest"
-            if dff["report_date"].notna().any():
-                as_of = str(dff["report_date"].max().date())
+        as_of = "Latest"
+        if dff["report_date"].notna().any():
+            as_of = str(dff["report_date"].max().date())
 
-            st.markdown(
-                f"""<div style='font-size:18px; margin-top:8px;'><b>As of:</b> {as_of}</div>""",
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f"""<div style='font-size:16px; margin-top:6px;'><b>As of:</b> {as_of}</div>""",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
 
-            # Extra breathing room so the masthead feels intentional
-            st.markdown("<div style='height:1.15rem'></div>", unsafe_allow_html=True)
+    st.divider()
 
-        st.divider()
+    # Ask NARS
+    st.markdown("### Ask NARS (Prototype)")
+    qcols = st.columns([5, 1])
+    q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
+    if qcols[1].button("Ask"):
+        st.session_state["_ask_answer"] = answer_question(dff, q, sev_thresh)
+    if st.session_state.get("_ask_answer"):
+        st.write(st.session_state["_ask_answer"])
 
-        # Ask NARS (freeform only)
-        st.markdown("### Ask NARS (Prototype)")
-        qcols = st.columns([5, 1])
-        q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
-        if qcols[1].button("Ask"):
-            st.session_state["_ask_answer"] = answer_question(dff, q, sev_thresh)
-        if st.session_state.get("_ask_answer"):
-            st.write(st.session_state["_ask_answer"])
+    st.divider()
 
-        st.divider()
+    render_kpi_row(dff, sev_thresh)
 
-        render_kpi_row(dff, sev_thresh)
+    st.divider()
 
-        st.divider()
+    render_trend_section(dff, sev_thresh)
 
-        render_trend_section(dff, sev_thresh)
+    st.divider()
 
-        st.divider()
+    render_high_severity_table(dff, sev_thresh)
 
-        render_high_severity_table(dff, sev_thresh)
+    st.divider()
 
-        # Restore the bottom sections you said disappeared
-        st.divider()
+    render_mix_and_distribution(dff, sev_thresh)
 
-        render_mix_and_distribution(dff, sev_thresh)
+    st.divider()
 
-        st.divider()
+    render_operational_kpis(dff, sev_thresh)
 
-        render_operational_kpis(dff, sev_thresh)
+    st.divider()
 
-        st.divider()
-
-        render_metric_rolodex_accident_year(dff, sev_thresh)
+    render_metric_rolodex_accident_year(dff, sev_thresh)
 
 
 if __name__ == "__main__":
