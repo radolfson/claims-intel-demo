@@ -148,7 +148,6 @@ REQUIRED_COLUMNS = [
     "is_litigated",
     "vendor_name",
     "defense_firm",
-    "denial_reason",
 ]
 
 
@@ -183,50 +182,10 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["trend_month"] = pd.NaT
 
-    for col in ("client", "state", "coverage_type", "feature_status", "adjuster", "line_of_business", "cause_of_loss", "vendor_name", "defense_firm", "denial_reason"):
+    for col in ("client", "state", "coverage_type", "feature_status", "adjuster", "line_of_business", "cause_of_loss"):
         d[col] = d[col].astype("string")
 
     d["accident_year"] = pd.to_numeric(d["accident_year"], errors="coerce")
-
-    return d
-
-
-def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
-    """Demo helper: add a denial_reason field only for DENIED features.
-
-    - Keeps the same reason per feature_key deterministically.
-    - Includes 'MCS90' as requested.
-    """
-    reasons = [
-        "MCS90",
-        "Coverage Exclusion",
-        "Late Notice",
-        "Policy Lapse",
-        "Fraud Suspected",
-        "No Liability",
-    ]
-
-    d = df.copy()
-    status = d["feature_status"].fillna("").astype(str).str.upper()
-    denied = status.eq("DENIED")
-
-    # Only assign for denied rows; otherwise leave blank so the filter behaves as expected.
-    d["denial_reason"] = d.get("denial_reason", pd.Series([None] * len(d)))
-    d["denial_reason"] = d["denial_reason"].astype("string")
-
-    def pick_reason(fk) -> str:
-        s = str(fk) if fk is not None else ""
-        # deterministic hash -> stable bucket
-        h = 0
-        for ch in s:
-            h = (h * 31 + ord(ch)) % 10_000
-        return reasons[h % len(reasons)]
-
-    if denied.any():
-        d.loc[denied, "denial_reason"] = d.loc[denied, "feature_key"].apply(pick_reason).astype("string")
-
-    # Normalize blanks to NA
-    d["denial_reason"] = d["denial_reason"].replace({"": pd.NA})
 
     return d
 
@@ -334,7 +293,6 @@ def init_filter_state() -> None:
     st.session_state.setdefault("f_litigated", "All")
     st.session_state.setdefault("f_vendor", "All Vendors")
     st.session_state.setdefault("f_defense", "All Firms")
-    st.session_state.setdefault("f_denial_reason", "All Reasons")
     st.session_state.setdefault("f_sev_thresh", DEFAULT_SEVERITY_THRESHOLD)
 
 
@@ -368,8 +326,6 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         dff = dff[dff["vendor_name"] == st.session_state["f_vendor"]]
     if st.session_state["f_defense"] != "All Firms":
         dff = dff[dff["defense_firm"] == st.session_state["f_defense"]]
-    if st.session_state.get("f_denial_reason", "All Reasons") != "All Reasons":
-        dff = dff[dff["denial_reason"] == st.session_state["f_denial_reason"]]
 
     return dff
 
@@ -423,14 +379,11 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
         return pd.DataFrame(columns=["trend_month"])
 
     m["is_hs"] = (m["incurred_amount"] >= sev_thresh).astype(int)
-    m["is_closed"] = m["feature_status"].fillna("").astype(str).str.upper().eq("CLOSED").astype(int)
-
     roll = (
         m.groupby("trend_month", as_index=False)
         .agg(
             total_features=("feature_key", "count"),
             open_features=("is_open_inventory", "sum"),
-            closed_features=("is_closed", "sum"),
             total_incurred=("incurred_amount", "sum"),
             paid=("paid_amount", "sum"),
             outstanding=("outstanding_amount", "sum"),
@@ -440,10 +393,6 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
     )
     roll["reserve_ratio"] = roll.apply(
         lambda r: (r["outstanding"] / r["total_incurred"] * 100.0) if r["total_incurred"] else 0.0,
-        axis=1,
-    )
-    roll["closing_ratio"] = roll.apply(
-        lambda r: (r["open_features"] / r["closed_features"]) if r.get("closed_features", 0) else None,
         axis=1,
     )
     return roll
@@ -522,11 +471,12 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
 
 
 def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("<div class='headline-title'>Today’s Headlines</div>", unsafe_allow_html=True)
+    st.markdown("### Today’s Headlines")
     bullets = build_headline_story(dff, sev_thresh)
-
-    for b in bullets:
-        st.markdown(f"<div class='headline-box'>{b}</div>", unsafe_allow_html=True)
+    st.info(bullets[0])
+    st.success(bullets[1])
+    st.warning(bullets[2])
+    st.info(bullets[3])
 
 
 # ============================================================
@@ -564,10 +514,10 @@ def answer_question(dff: pd.DataFrame, q: str, sev_thresh: float) -> str:
 # ============================================================
 # UI Sections
 # ============================================================
-def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -> None:
+def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
     k = calc_kpis(dff, sev_thresh)
 
-    st.markdown(f"### Key Metrics (2021-Present)")
+    st.markdown("### Key Metrics")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Open Features", fmt_int(k["open_features"]))
     c2.metric("Total Incurred", fmt_money_compact(k["total_incurred"]))
@@ -577,67 +527,51 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float, timeframe_label: str) -
 
 
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Trends (vs prior month)")
+    st.markdown("### Trends")
     roll = monthly_rollup(dff, sev_thresh)
-
-    # Only show the most recent period (demo request): start of 2025 onward
-    roll = roll.sort_values("trend_month")
-    roll = roll[roll["trend_month"] >= pd.Timestamp("2025-01-01")]
-
     if roll.empty or roll["trend_month"].nunique() < 2:
-        st.caption("Not enough monthly history to show trends since 2025 (need 2+ months).")
+        st.caption("Not enough monthly history to show trends (need 2+ months).")
         return
 
+    roll = roll.sort_values("trend_month")
+
     metrics = [
+        ("open_features", "Open Features", False),
         ("total_incurred", "Total Incurred", True),
         ("paid", "Paid", True),
         ("outstanding", "Outstanding", True),
         ("high_sev", "High Severity Features", False),
     ]
 
-    stat_cols = st.columns(4)
-    for i, (col, label, is_money) in enumerate(metrics):
+    stat_cols = st.columns(5)
+    for idx, (col, label, is_money) in enumerate(metrics):
         curr, prev = last_two_months(roll, col)
         delta = pct_change(curr or 0, prev or 0) if prev is not None else None
         display_val = fmt_money_compact(curr) if is_money else fmt_int(curr)
         display_delta = None if delta is None else f"{delta:+.1f}%"
-        stat_cols[i].metric(label, display_val, display_delta, delta_color="off")
+        stat_cols[idx].metric(label, display_val, display_delta)
 
     st.divider()
 
-    def line(metric_col: str, title: str, height: int = 360) -> None:
-        vals = pd.to_numeric(roll[metric_col], errors="coerce").fillna(0.0)
-        vmin = float(vals.min())
-        vmax = float(vals.max())
-
-        # Tighten axis so trends are readable (but don't force a hard zero)
-        if vmin == vmax:
-            pad = 1.0 if vmax == 0 else abs(vmax) * 0.05
-        else:
-            pad = (vmax - vmin) * 0.15
-
-        domain = [vmin - pad, vmax + pad]
-
+    def line(metric_col: str, title: str) -> None:
         st.altair_chart(
             alt.Chart(roll)
             .mark_line(point=True)
             .encode(
                 x=alt.X("trend_month:T", title="Month"),
-                y=alt.Y(
-                    f"{metric_col}:Q",
-                    title=None,
-                    scale=alt.Scale(domain=domain, zero=False),
-                ),
-                tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q", format=",.2f")],
+                y=alt.Y(f"{metric_col}:Q", title=None),
+                tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q")],
             )
-            .properties(title=title, height=height),
+            .properties(title=title, height=220),
             use_container_width=True,
         )
 
-    r1 = st.columns(2)
+    r1 = st.columns(3)
     with r1[0]:
-        line("total_incurred", "Total Incurred ($)")
+        line("open_features", "Open Features")
     with r1[1]:
+        line("total_incurred", "Total Incurred ($)")
+    with r1[2]:
         line("paid", "Paid ($)")
 
     r2 = st.columns(2)
@@ -645,7 +579,6 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
         line("outstanding", "Outstanding ($)")
     with r2[1]:
         line("high_sev", "High Severity Features")
-
 
 
 def render_high_severity_table(dff: pd.DataFrame, sev_thresh: float) -> None:
@@ -692,8 +625,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .fillna("UNKNOWN")
             .astype(str)
             .value_counts()
-            .reset_index(name="count")
-            .rename(columns={"index": "feature_status"})
+            .reset_index()
+            .rename(columns={"index": "feature_status", "feature_status": "count"})
         )
         if s.empty:
             st.caption("No data.")
@@ -706,7 +639,7 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                     color=alt.Color("feature_status:N", legend=alt.Legend(title=None)),
                     tooltip=["feature_status:N", "count:Q"],
                 )
-                .properties(height=260)
+                .properties(height=240)
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -719,8 +652,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .astype(str)
             .value_counts()
             .head(8)
-            .reset_index(name="count")
-            .rename(columns={"index": "coverage_type"})
+            .reset_index()
+            .rename(columns={"index": "coverage_type", "coverage_type": "count"})
         )
         if cv.empty:
             st.caption("No data.")
@@ -733,7 +666,7 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                     y=alt.Y("coverage_type:N", sort="-x", title=None),
                     tooltip=["coverage_type:N", "count:Q"],
                 )
-                .properties(height=260)
+                .properties(height=240)
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -744,12 +677,10 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
         labels = ["$0–50K", "$50–100K", "$100–250K", "$250–500K", "$500K–1M", "$1M–5M", "$5M+"]
 
         v = dff["incurred_amount"].fillna(0.0)
+        # pd.cut requires len(labels) == len(bins) if include_lowest etc. We'll handle last bin separately.
         b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
-        # Make the Series name explicit so reset_index is predictable
-        b = b.rename("bucket")
-
-        out = b.value_counts(sort=False).reset_index(name="count")
-        out = out.rename(columns={"bucket": "bucket"})
+        out = b.value_counts().sort_index().reset_index()
+        out.columns = ["bucket", "count"]
 
         # Add a $5M+ bucket
         over = int((v >= bins[-1]).sum())
@@ -758,8 +689,6 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                 [out, pd.DataFrame({"bucket": [labels[-1]], "count": [over]})],
                 ignore_index=True,
             )
-
-        out["bucket"] = out["bucket"].astype(str)
 
         if out.empty:
             st.caption("No data.")
@@ -772,7 +701,7 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
                     y=alt.Y("count:Q", title=None),
                     tooltip=["bucket:N", "count:Q"],
                 )
-                .properties(height=260)
+                .properties(height=240)
             )
             st.altair_chart(chart, use_container_width=True)
 
@@ -837,87 +766,6 @@ def render_geographic_concentration(dff: pd.DataFrame) -> None:
             st.altair_chart(chart, use_container_width=True)
 
 
-def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
-    """Average cycle time (days): feature_created_date -> first month with paid_amount > 0.
-
-    Implementation (demo-friendly, deterministic):
-    - First paid month = earliest trend_month where paid_amount > 0 for each feature_key
-    - Open date = earliest feature_created_date for each feature_key
-    - Cycle days = (first_paid_month - open_date).days, keeping only positive values
-    """
-    if dff.empty:
-        return None
-
-    if dff["feature_created_date"].isna().all() or dff["trend_month"].isna().all():
-        return None
-
-    base = dff.dropna(subset=["feature_key", "feature_created_date", "trend_month"]).copy()
-    if base.empty:
-        return None
-
-    # First month with any paid > 0 for each feature
-    paid_pos = base[base["paid_amount"] > 0].copy()
-    if paid_pos.empty:
-        return None
-
-    first_paid = (
-        paid_pos.sort_values(["feature_key", "trend_month"])
-        .groupby("feature_key", as_index=False)
-        .first()[["feature_key", "trend_month"]]
-        .rename(columns={"trend_month": "first_paid_month"})
-    )
-
-    opened = (
-        base.sort_values(["feature_key", "feature_created_date"])
-        .groupby("feature_key", as_index=False)
-        .first()[["feature_key", "feature_created_date"]]
-    )
-
-    j = opened.merge(first_paid, on="feature_key", how="inner")
-    if j.empty:
-        return None
-
-    j["cycle_days"] = (j["first_paid_month"] - j["feature_created_date"]).dt.days
-
-    # Avoid weird demo artifacts: keep strictly positive durations
-    j = j[j["cycle_days"] > 0]
-    if j.empty:
-        return None
-
-    return float(j["cycle_days"].mean())
-
-
-
-def render_operational_kpis(dff: pd.DataFrame, sev_thresh: float) -> None:
-    """Replaces 'Geographic Concentration' with Cycle Time, Closing Ratio, and Denial Reason."""
-    st.markdown("### Operational Metrics")
-
-    roll = monthly_rollup(dff, sev_thresh).sort_values("trend_month")
-    latest = roll.iloc[-1] if not roll.empty else None
-
-    cycle = calc_cycle_time_days(dff)
-    # Demo-friendly fallback: if cycle time can’t be computed from available data, show a realistic value
-    if cycle is None or cycle <= 0:
-        cycle = 25.0
-    cycle_disp = f"{cycle:,.0f} days"
-
-    closing_ratio = None
-    if latest is not None and "closing_ratio" in latest.index:
-        closing_ratio = latest["closing_ratio"]
-    closing_disp = "—" if closing_ratio is None else f"{closing_ratio:,.2f}"
-
-    denied = dff[dff["feature_status"].fillna("").astype(str).str.upper().eq("DENIED")]
-    top_reason = "—"
-    if not denied.empty and denied["denial_reason"].notna().any():
-        top_reason = str(denied["denial_reason"].value_counts().idxmax())
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Cycle Time", cycle_disp, help="Avg days from reserve open (feature_created_date) until first month with paid_amount > 0.")
-    c2.metric("Closing Ratio", closing_disp, help="Open features / Closed features for the latest month in the selection.")
-    c3.metric("Top Denial Reason", top_reason, help="Most common denial reason among DENIED features in the selection.")
-
-
-
 def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Metric Rolodex (Accident Year)")
 
@@ -964,112 +812,209 @@ def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) ->
 # ============================================================
 # Main
 # ============================================================
-def main() -> None:
-    st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide", initial_sidebar_state="expanded")
+# -----------------------------
+# Email delivery (SendGrid)
+# -----------------------------
+import html
 
-    # ============================================================
-    # Reliable fixed panels:
-    # - Filters in st.sidebar (separate scroll container)
-    # - Sidebar docked to RIGHT via CSS
-    # - Headlines rendered as FIXED left panel (not sticky columns)
-    # - Main content padded left/right so it never overlaps panels
-    # ============================================================
+def _build_email_html(headlines: list[str], dashboard_url: str, as_of: str) -> str:
+    """Simple, eye-catching HTML email (no external assets, works in Outlook/Gmail)."""
+    safe_url = html.escape(dashboard_url, quote=True)
+    safe_as_of = html.escape(as_of)
+
+    cards = []
+    for h in headlines:
+        h_safe = html.escape(h)
+        cards.append(f"""
+        <tr>
+          <td style="padding:10px 0;">
+            <div style="border:1px solid #e5e7eb; border-left:6px solid #1f4e79; border-radius:10px; padding:14px 16px; font-family:Arial,Helvetica,sans-serif; font-size:14px; color:#111827; line-height:1.4;">
+              {h_safe}
+            </div>
+          </td>
+        </tr>
+        """)
+
+    cards_html = "\n".join(cards) if cards else "<tr><td style='padding:10px 0; font-family:Arial,Helvetica,sans-serif; color:#6b7280;'>No headlines available.</td></tr>"
+
+    return f"""<!doctype html>
+<html>
+  <body style="margin:0; padding:0; background:#ffffff;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#ffffff;">
+      <tr>
+        <td align="center" style="padding:24px 16px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" width="680" style="max-width:680px; width:100%;">
+            <tr>
+              <td style="font-family:Arial,Helvetica,sans-serif;">
+                <div style="font-size:18px; font-weight:700; color:#111827;">Cover Whale Daily, Powered by NARS</div>
+                <div style="font-size:12px; color:#6b7280; margin-top:4px;">As of: {safe_as_of}</div>
+              </td>
+            </tr>
+
+            <tr><td style="height:14px;"></td></tr>
+
+            <tr>
+              <td>
+                <div style="font-family:Arial,Helvetica,sans-serif; font-size:14px; color:#374151;">
+                  Here are today’s headlines:
+                </div>
+              </td>
+            </tr>
+
+            <tr><td style="height:8px;"></td></tr>
+
+            <tr>
+              <td>
+                <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+                  {cards_html}
+                </table>
+              </td>
+            </tr>
+
+            <tr><td style="height:18px;"></td></tr>
+
+            <tr>
+              <td align="center">
+                <a href="{safe_url}"
+                   style="display:inline-block; background:#1f4e79; color:#ffffff; text-decoration:none; font-family:Arial,Helvetica,sans-serif;
+                          font-size:14px; font-weight:700; padding:12px 18px; border-radius:10px;">
+                  Open Dashboard
+                </a>
+                <div style="font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#6b7280; margin-top:10px;">
+                  Or copy/paste: <span style="color:#1f4e79;">{safe_url}</span>
+                </div>
+              </td>
+            </tr>
+
+            <tr><td style="height:10px;"></td></tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+"""
+
+
+def _send_email_sendgrid(to_email: str, subject: str, html_content: str) -> tuple[bool, str]:
+    """Send an email via SendGrid. Requires secrets: SENDGRID_API_KEY and SENDGRID_FROM."""
+    api_key = None
+    from_email = None
+
+    # Streamlit secrets first, then env vars as fallback
+    try:
+        api_key = st.secrets.get("SENDGRID_API_KEY")
+        from_email = st.secrets.get("SENDGRID_FROM")
+    except Exception:
+        api_key = None
+        from_email = None
+
+    api_key = api_key or os.getenv("SENDGRID_API_KEY")
+    from_email = from_email or os.getenv("SENDGRID_FROM")
+
+    if not api_key or not from_email:
+        return (False, "Missing SENDGRID_API_KEY / SENDGRID_FROM (set in Streamlit Secrets).")
+
+    try:
+        import requests  # Streamlit Cloud usually has it; if not, add to requirements.txt
+    except Exception as e:
+        return (False, f"Missing dependency 'requests': {e}")
+
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html_content}],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code in (200, 202):
+            return (True, "Sent.")
+        # 401 is the classic “your key is wrong/expired/revoked”
+        if resp.status_code == 401:
+            return (False, "SendGrid 401 Unauthorized: API key invalid/expired/revoked (create a new key + update Streamlit Secrets).")
+        return (False, f"SendGrid error {resp.status_code}: {resp.text[:500]}")
+    except Exception as e:
+        return (False, f"SendGrid request failed: {e}")
+
+
+def render_email_section(dff: pd.DataFrame, headlines: list[str]) -> None:
+    st.markdown("### Email this summary")
+
+    # Determine as-of date and dashboard URL
+    as_of = "Latest"
+    if "report_date" in dff.columns and dff["report_date"].notna().any():
+        try:
+            as_of = str(pd.to_datetime(dff["report_date"]).max().date())
+        except Exception:
+            as_of = "Latest"
+
+    dashboard_url = None
+    try:
+        dashboard_url = st.secrets.get("DASHBOARD_URL")
+    except Exception:
+        dashboard_url = None
+    dashboard_url = dashboard_url or os.getenv("DASHBOARD_URL") or "https://nars-demo.streamlit.app"
+
+    to_email = st.text_input("Recipient email", placeholder="name@company.com", label_visibility="collapsed", key="email_to")
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        send = st.button("Send email", use_container_width=True)
+    with c2:
+        st.caption("Requires SendGrid secrets in Streamlit Cloud. If it fails with 401, your API key is wrong. Humans, always with the wrong keys.")
+
+    if send:
+        if not to_email or "@" not in to_email:
+            st.error("Enter a valid recipient email address.")
+            return
+
+        subject = f"Cover Whale Daily (As of {as_of})"
+        html_body = _build_email_html(headlines=headlines, dashboard_url=dashboard_url, as_of=as_of)
+
+        ok, msg = _send_email_sendgrid(to_email=to_email, subject=subject, html_content=html_body)
+        if ok:
+            st.success("Email sent.")
+        else:
+            st.error(f"Email failed: {msg}")
+
+def main() -> None:
+    st.set_page_config(page_title="Claims Intelligence – Daily Summary", layout="wide")
+
+    # Sticky side columns (headlines + filters) without covering header/logo
     st.markdown(
         """
         <style>
           :root{
-            --leftPanelWidth: 22.5rem;
-            --rightPanelWidth: 20.5rem;
-            --panelTop: 7.8rem; /* below masthead */
+            --stickyTop: 0.75rem;
           }
 
-          /* Main page padding to make room for fixed panels */
-          .block-container {
-            max-width: 1750px;
-            margin-left: auto;
-            margin-right: auto;
-            padding-top: 4.4rem;
-            padding-left: calc(var(--leftPanelWidth) + 1.75rem);
-            padding-right: calc(var(--rightPanelWidth) + 1.25rem);
-          }
+          /* Let sticky children behave correctly */
+          div[data-testid="stHorizontalBlock"] { overflow: visible !important; }
+          div[data-testid="stColumn"] { overflow: visible !important; }
 
-          /* Sidebar dock to RIGHT + size */
-          section[data-testid="stSidebar"]{
-            left: auto !important;
-            right: 0.75rem !important;
-            width: var(--rightPanelWidth) !important;
-            min-width: var(--rightPanelWidth) !important;
-            max-width: var(--rightPanelWidth) !important;
-            border-left: 1px solid rgba(16,42,67,0.10);
-            background: #F7FAFC;
-            box-shadow: 0 2px 10px rgba(16,42,67,0.06);
-            border-radius: 12px;
-            margin-top: 0.75rem;
-            margin-bottom: 0.75rem;
-          }
-          section[data-testid="stSidebar"] > div{
-            padding: 0.75rem 0.65rem 1.0rem 0.65rem;
-            height: 100vh;
+          .sticky-col {
+            position: -webkit-sticky;
+            position: sticky;
+            top: var(--stickyTop);
+            align-self: flex-start;
+            max-height: calc(100vh - var(--stickyTop) - 1rem);
             overflow-y: auto;
-            overscroll-behavior: contain;
+            background: white;
+            z-index: 2;
+            padding-right: 0.25rem;
           }
 
-
-          /* Force sidebar to behave like a fixed right rail (Streamlit renders it on the left by default) */
-          section[data-testid="stSidebar"]{
-            position: fixed !important;
-            top: 0 !important;
-            bottom: 0 !important;
-            right: 0 !important;
-            left: auto !important;
-            transform: none !important;
-            z-index: 100 !important;
-          }
-
-          /* Remove the collapse/expand control entirely */
-          [data-testid="collapsedControl"]{ display: none !important; }
-          button[data-testid="stSidebarCollapseButton"]{ display: none !important; }
-          button[title="Close sidebar"]{ display: none !important; }
-          button[title="Open sidebar"]{ display: none !important; }
-
-          /* In some Streamlit builds the control is an <a> */
-          a[title="Open sidebar"], a[title="Close sidebar"]{ display: none !important; }
-
-          /* Hide any remaining sidebar toggle chevrons / collapsed controls */
-          [data-testid="stSidebarCollapsedControl"]{ display:none !important; }
-          [data-testid="stSidebarNav"]{ display:none !important; }
-
-
-          /* Fixed left headlines panel */
-          #left-headlines-panel{
-            position: fixed;
-            top: var(--panelTop);
-            left: 1.25rem;
-            width: var(--leftPanelWidth);
-            max-height: calc(100vh - var(--panelTop) - 1rem);
-            overflow: hidden; /* stay put; no internal scroll */
-            background: transparent;
-            z-index: 10;
-          }
-
-          .headline-title{
-            font-size: 1.35rem;
-            font-weight: 800;
-            margin: 0.25rem 0 0.85rem 0;
-            color: #102A43;
-          }
-
-          .headline-box{
-            background: #F3F6FA;
-            border-left: 6px solid #1F4E79;
-            padding: 1.05rem 1.0rem;
-            margin: 0.85rem 0;
-            border-radius: 12px;
-            font-size: 1.08rem;
-            line-height: 1.55;
-            color: #102A43;
-            box-shadow: 0 1px 0 rgba(16,42,67,0.06);
-          }
+          .block-container { padding-top: 1.0rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1085,13 +1030,13 @@ def main() -> None:
 
     df_std = standardize_financials(df, strict_incurred_open_only=False)
     df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
-    df_std = add_synthetic_denial_reason(df_std)
 
-    # ----------------------------
-    # Filters (RIGHT panel): use sidebar so it scrolls independently
-    # ----------------------------
-    with st.sidebar:
-        st.markdown("## Filters")
+    ribbon_col, main_col, filter_col = st.columns([1.25, 3.2, 1.25], gap="large")
+
+    # Filters (right sticky)
+    with filter_col:
+        st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
+        st.markdown("### Filters")
 
         states = ["All States"] + safe_list(df_std["state"])
         years = ["All Years"] + [str(int(y)) for y in safe_list(df_std["accident_year"]) if pd.notna(y)]
@@ -1102,7 +1047,6 @@ def main() -> None:
         causes = ["All Causes"] + safe_list(df_std["cause_of_loss"])
         vendors = ["All Vendors"] + safe_list(df_std["vendor_name"])
         firms = ["All Firms"] + safe_list(df_std["defense_firm"])
-        denials = ["All Reasons"] + [x for x in safe_list(df_std["denial_reason"]) if x not in (None, "", "nan")]
 
         st.selectbox("State", states, key="f_state")
         st.selectbox("Accident Year", years, key="f_acc_year")
@@ -1114,7 +1058,6 @@ def main() -> None:
         st.selectbox("Litigation", ["All", "Litigated", "Not Litigated"], key="f_litigated")
         st.selectbox("Vendor", vendors, key="f_vendor")
         st.selectbox("Defense Firm", firms, key="f_defense")
-        st.selectbox("Denial Reason", denials, key="f_denial_reason")
 
         st.number_input(
             "High severity threshold",
@@ -1126,100 +1069,78 @@ def main() -> None:
 
         st.button("Reset Filters", on_click=reset_filters)
         st.caption(f"Data source: **{src}**")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     dff = apply_filters(df_std)
     sev_thresh = float(st.session_state["f_sev_thresh"])
 
-    # ----------------------------
-    # Fixed left headlines panel
-    # ----------------------------
-    bullets = build_headline_story(dff, sev_thresh)
-    headline_html = "<div id='left-headlines-panel'>"
-    headline_html += "<div class='headline-title'>Today’s Headlines</div>"
-    for b in bullets:
-        headline_html += f"<div class='headline-box'>{b}</div>"
-    headline_html += "</div>"
-    st.markdown(headline_html, unsafe_allow_html=True)
+    # Headlines ribbon (left sticky)
+    with ribbon_col:
+        st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
+        render_headlines_ribbon(dff, sev_thresh)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # ----------------------------
     # Main content
-    # ----------------------------
-    mast = st.columns([0.22, 0.78], vertical_alignment="center")
+    with main_col:
+        # Newspaper-style masthead (aligned left within main content)
+        mast = st.columns([0.16, 0.84], vertical_alignment="center")
+        with mast[0]:
+            logo_path = "narslogo.jpg"
+            if os.path.exists(logo_path):
+                st.image(logo_path, width=150)
+        with mast[1]:
+            st.markdown(
+                """
+                <div style="line-height:1.05">
+                  <div style="font-size:34px; font-weight:700;">Claims Intelligence – Daily Summary</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            as_of = "Latest"
+            if dff["report_date"].notna().any():
+                as_of = str(dff["report_date"].max().date())
+            st.markdown(f"**As of:** {as_of}")
 
-    with mast[0]:
-        from pathlib import Path
-        logo_path = Path(__file__).resolve().parent / "narslogo.jpg"
-        if logo_path.exists():
-            st.image(str(logo_path), width=280)
+        st.divider()
 
-    with mast[1]:
-        st.markdown(
-            """
-            <div style="line-height:1.05; padding-top:6px;">
-              <div style="font-size:30px; font-weight:650; letter-spacing:0.25px;">
-                Cover Whale Daily, Powered by NARS
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        # Ask NARS (freeform only)
+        st.markdown("### Ask NARS (Prototype)")
+        qcols = st.columns([5, 1])
+        q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
+        if qcols[1].button("Ask"):
+            st.session_state["_ask_answer"] = answer_question(dff, q, sev_thresh)
+        if st.session_state.get("_ask_answer"):
+            st.write(st.session_state["_ask_answer"])
 
-        as_of = "Latest"
-        if dff["report_date"].notna().any():
-            as_of = str(dff["report_date"].max().date())
+        st.divider()
 
-        st.markdown(
-            f"""<div style='font-size:16px; margin-top:6px;'><b>As of:</b> {as_of}</div>""",
-            unsafe_allow_html=True,
-        )
-        st.markdown("<div style='height:1.0rem'></div>", unsafe_allow_html=True)
+        render_kpi_row(dff, sev_thresh)
 
-    st.divider()
+        st.divider()
 
-    # Ask NARS
-    st.markdown("### Ask NARS (Prototype)")
-    qcols = st.columns([5, 1])
-    q = qcols[0].text_input("Ask a question...", label_visibility="collapsed")
-    if qcols[1].button("Ask"):
-        st.session_state["_ask_answer"] = answer_question(dff, q, sev_thresh)
-    if st.session_state.get("_ask_answer"):
-        st.write(st.session_state["_ask_answer"])
+        render_trend_section(dff, sev_thresh)
 
-    st.divider()
+        st.divider()
 
-    # Timeframe label for Key Metrics: based on dates present in the filtered selection
-    timeframe_label = "Current selection"
-    if dff["report_date"].notna().any():
-        _min_d = dff["report_date"].min().date()
-        _max_d = dff["report_date"].max().date()
-        timeframe_label = f"{_min_d} to {_max_d}"
-    elif dff["trend_month"].notna().any():
-        _min_m = dff["trend_month"].min().date()
-        _max_m = dff["trend_month"].max().date()
-        timeframe_label = f"{_min_m} to {_max_m}"
+        render_high_severity_table(dff, sev_thresh)
 
-    render_kpi_row(dff, sev_thresh, timeframe_label)
+        # Restore the bottom sections you said disappeared
+        st.divider()
 
-    st.divider()
+        render_mix_and_distribution(dff, sev_thresh)
 
-    render_trend_section(dff, sev_thresh)
+        st.divider()
 
-    st.divider()
+        render_geographic_concentration(dff)
 
-    render_high_severity_table(dff, sev_thresh)
+        st.divider()
 
-    st.divider()
-
-    render_mix_and_distribution(dff, sev_thresh)
-
-    st.divider()
-
-    render_operational_kpis(dff, sev_thresh)
-
-    st.divider()
-
-    render_metric_rolodex_accident_year(dff, sev_thresh)
+        render_metric_rolodex_accident_year(dff, sev_thresh)
 
 
+
+        # Email delivery
+        render_email_section(dff, build_headline_story(dff, sev_thresh))
 if __name__ == "__main__":
     main()
