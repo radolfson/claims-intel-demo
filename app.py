@@ -148,6 +148,7 @@ REQUIRED_COLUMNS = [
     "is_litigated",
     "vendor_name",
     "defense_firm",
+    "denial_reason",
 ]
 
 
@@ -182,10 +183,50 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         d["trend_month"] = pd.NaT
 
-    for col in ("client", "state", "coverage_type", "feature_status", "adjuster", "line_of_business", "cause_of_loss"):
+    for col in ("client", "state", "coverage_type", "feature_status", "adjuster", "line_of_business", "cause_of_loss", "vendor_name", "defense_firm", "denial_reason"):
         d[col] = d[col].astype("string")
 
     d["accident_year"] = pd.to_numeric(d["accident_year"], errors="coerce")
+
+    return d
+
+
+def add_synthetic_denial_reason(df: pd.DataFrame) -> pd.DataFrame:
+    """Demo helper: add a denial_reason field only for DENIED features.
+
+    - Keeps the same reason per feature_key deterministically.
+    - Includes 'MCS90' as requested.
+    """
+    reasons = [
+        "MCS90",
+        "Coverage Exclusion",
+        "Late Notice",
+        "Policy Lapse",
+        "Fraud Suspected",
+        "No Liability",
+    ]
+
+    d = df.copy()
+    status = d["feature_status"].fillna("").astype(str).str.upper()
+    denied = status.eq("DENIED")
+
+    # Only assign for denied rows; otherwise leave blank so the filter behaves as expected.
+    d["denial_reason"] = d.get("denial_reason", pd.Series([None] * len(d)))
+    d["denial_reason"] = d["denial_reason"].astype("string")
+
+    def pick_reason(fk) -> str:
+        s = str(fk) if fk is not None else ""
+        # deterministic hash -> stable bucket
+        h = 0
+        for ch in s:
+            h = (h * 31 + ord(ch)) % 10_000
+        return reasons[h % len(reasons)]
+
+    if denied.any():
+        d.loc[denied, "denial_reason"] = d.loc[denied, "feature_key"].apply(pick_reason).astype("string")
+
+    # Normalize blanks to NA
+    d["denial_reason"] = d["denial_reason"].replace({"": pd.NA})
 
     return d
 
@@ -293,6 +334,7 @@ def init_filter_state() -> None:
     st.session_state.setdefault("f_litigated", "All")
     st.session_state.setdefault("f_vendor", "All Vendors")
     st.session_state.setdefault("f_defense", "All Firms")
+    st.session_state.setdefault("f_denial_reason", "All Reasons")
     st.session_state.setdefault("f_sev_thresh", DEFAULT_SEVERITY_THRESHOLD)
 
 
@@ -326,6 +368,8 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         dff = dff[dff["vendor_name"] == st.session_state["f_vendor"]]
     if st.session_state["f_defense"] != "All Firms":
         dff = dff[dff["defense_firm"] == st.session_state["f_defense"]]
+    if st.session_state.get("f_denial_reason", "All Reasons") != "All Reasons":
+        dff = dff[dff["denial_reason"] == st.session_state["f_denial_reason"]]
 
     return dff
 
@@ -379,11 +423,14 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
         return pd.DataFrame(columns=["trend_month"])
 
     m["is_hs"] = (m["incurred_amount"] >= sev_thresh).astype(int)
+    m["is_closed"] = m["feature_status"].fillna("").astype(str).str.upper().eq("CLOSED").astype(int)
+
     roll = (
         m.groupby("trend_month", as_index=False)
         .agg(
             total_features=("feature_key", "count"),
             open_features=("is_open_inventory", "sum"),
+            closed_features=("is_closed", "sum"),
             total_incurred=("incurred_amount", "sum"),
             paid=("paid_amount", "sum"),
             outstanding=("outstanding_amount", "sum"),
@@ -393,6 +440,10 @@ def monthly_rollup(dff: pd.DataFrame, sev_thresh: float) -> pd.DataFrame:
     )
     roll["reserve_ratio"] = roll.apply(
         lambda r: (r["outstanding"] / r["total_incurred"] * 100.0) if r["total_incurred"] else 0.0,
+        axis=1,
+    )
+    roll["closing_ratio"] = roll.apply(
+        lambda r: (r["open_features"] / r["closed_features"]) if r.get("closed_features", 0) else None,
         axis=1,
     )
     return roll
@@ -473,10 +524,9 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
 def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Today’s Headlines")
     bullets = build_headline_story(dff, sev_thresh)
-    st.info(bullets[0])
-    st.success(bullets[1])
-    st.warning(bullets[2])
-    st.info(bullets[3])
+
+    for b in bullets:
+        st.markdown(f"<div class='headline-box'>{b}</div>", unsafe_allow_html=True)
 
 
 # ============================================================
@@ -554,12 +604,25 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.divider()
 
     def line(metric_col: str, title: str) -> None:
+        vals = roll[metric_col].astype(float)
+        vmin = float(vals.min())
+        vmax = float(vals.max())
+        if vmin == vmax:
+            pad = 1.0 if vmax == 0 else abs(vmax) * 0.05
+        else:
+            pad = (vmax - vmin) * 0.08
+        domain = [vmin - pad, vmax + pad]
+
         st.altair_chart(
             alt.Chart(roll)
             .mark_line(point=True)
             .encode(
                 x=alt.X("trend_month:T", title="Month"),
-                y=alt.Y(f"{metric_col}:Q", title=None),
+                y=alt.Y(
+                    f"{metric_col}:Q",
+                    title=None,
+                    scale=alt.Scale(domain=domain, zero=False),
+                ),
                 tooltip=["trend_month:T", alt.Tooltip(f"{metric_col}:Q")],
             )
             .properties(title=title, height=220),
@@ -625,8 +688,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .fillna("UNKNOWN")
             .astype(str)
             .value_counts()
-            .reset_index(name="count")
-            .rename(columns={"index": "feature_status"})
+            .reset_index()
+            .rename(columns={"index": "feature_status", "feature_status": "count"})
         )
         if s.empty:
             st.caption("No data.")
@@ -652,8 +715,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
             .astype(str)
             .value_counts()
             .head(8)
-            .reset_index(name="count")
-            .rename(columns={"index": "coverage_type"})
+            .reset_index()
+            .rename(columns={"index": "coverage_type", "coverage_type": "count"})
         )
         if cv.empty:
             st.caption("No data.")
@@ -679,12 +742,8 @@ def render_mix_and_distribution(dff: pd.DataFrame, sev_thresh: float) -> None:
         v = dff["incurred_amount"].fillna(0.0)
         # pd.cut requires len(labels) == len(bins) if include_lowest etc. We'll handle last bin separately.
         b = pd.cut(v, bins=bins, labels=labels[: len(bins) - 1], include_lowest=True)
-        out = (
-            b.value_counts()
-            .sort_index()
-            .reset_index(name="count")
-            .rename(columns={"index": "bucket"})
-        )
+        out = b.value_counts().sort_index().reset_index()
+        out.columns = ["bucket", "count"]
 
         # Add a $5M+ bucket
         over = int((v >= bins[-1]).sum())
@@ -770,6 +829,67 @@ def render_geographic_concentration(dff: pd.DataFrame) -> None:
             st.altair_chart(chart, use_container_width=True)
 
 
+def calc_cycle_time_days(dff: pd.DataFrame) -> Optional[float]:
+    """Average cycle time (days): feature_created_date -> first month with paid_amount > 0."""
+    if dff.empty:
+        return None
+
+    if dff["feature_created_date"].isna().all() or dff["trend_month"].isna().all():
+        return None
+
+    base = dff.dropna(subset=["feature_key", "feature_created_date", "trend_month"]).copy()
+    if base.empty:
+        return None
+
+    paid_pos = base[base["paid_amount"] > 0].copy()
+    if paid_pos.empty:
+        return None
+
+    first_paid = (
+        paid_pos.groupby("feature_key", as_index=False)["trend_month"]
+        .min()
+        .rename(columns={"trend_month": "first_paid_month"})
+    )
+
+    opens = base.groupby("feature_key", as_index=False)["feature_created_date"].min()
+
+    j = opens.merge(first_paid, on="feature_key", how="inner")
+    if j.empty:
+        return None
+
+    j["cycle_days"] = (j["first_paid_month"] - j["feature_created_date"]).dt.days
+    j.loc[j["cycle_days"] < 0, "cycle_days"] = 0
+
+    return float(j["cycle_days"].mean())
+
+
+def render_operational_kpis(dff: pd.DataFrame, sev_thresh: float) -> None:
+    """Replaces 'Geographic Concentration' with Cycle Time, Closing Ratio, and Denial Reason."""
+    st.markdown("### Operational Metrics")
+
+    roll = monthly_rollup(dff, sev_thresh).sort_values("trend_month")
+    latest = roll.iloc[-1] if not roll.empty else None
+
+    cycle = calc_cycle_time_days(dff)
+    cycle_disp = "—" if cycle is None else f"{cycle:,.0f} days"
+
+    closing_ratio = None
+    if latest is not None and "closing_ratio" in latest.index:
+        closing_ratio = latest["closing_ratio"]
+    closing_disp = "—" if closing_ratio is None else f"{closing_ratio:,.2f}"
+
+    denied = dff[dff["feature_status"].fillna("").astype(str).str.upper().eq("DENIED")]
+    top_reason = "—"
+    if not denied.empty and denied["denial_reason"].notna().any():
+        top_reason = str(denied["denial_reason"].value_counts().idxmax())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cycle Time", cycle_disp, help="Avg days from reserve open (feature_created_date) until first month with paid_amount > 0.")
+    c2.metric("Closing Ratio", closing_disp, help="Open features / Closed features for the latest month in the selection.")
+    c3.metric("Top Denial Reason", top_reason, help="Most common denial reason among DENIED features in the selection.")
+
+
+
 def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Metric Rolodex (Accident Year)")
 
@@ -824,7 +944,7 @@ def main() -> None:
         """
         <style>
           :root{
-            --stickyTop: 4.25rem;
+            --stickyTop: 0.75rem;
           }
 
           /* Let sticky children behave correctly */
@@ -843,7 +963,7 @@ def main() -> None:
             padding-right: 0.25rem;
           }
 
-          .block-container { padding-top: 2.75rem; }
+          .block-container { padding-top: 1.0rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -859,6 +979,7 @@ def main() -> None:
 
     df_std = standardize_financials(df, strict_incurred_open_only=False)
     df_std = synthesize_monthly_history_to_start(df_std, start="2021-01-01", seed=7)
+    df_std = add_synthetic_denial_reason(df_std)
 
     ribbon_col, main_col, filter_col = st.columns([1.25, 3.2, 1.25], gap="large")
 
@@ -876,6 +997,7 @@ def main() -> None:
         causes = ["All Causes"] + safe_list(df_std["cause_of_loss"])
         vendors = ["All Vendors"] + safe_list(df_std["vendor_name"])
         firms = ["All Firms"] + safe_list(df_std["defense_firm"])
+        denials = ["All Reasons"] + [x for x in safe_list(df_std["denial_reason"]) if x not in (None, "", "nan")]
 
         st.selectbox("State", states, key="f_state")
         st.selectbox("Accident Year", years, key="f_acc_year")
@@ -887,6 +1009,7 @@ def main() -> None:
         st.selectbox("Litigation", ["All", "Litigated", "Not Litigated"], key="f_litigated")
         st.selectbox("Vendor", vendors, key="f_vendor")
         st.selectbox("Defense Firm", firms, key="f_defense")
+        st.selectbox("Denial Reason", denials, key="f_denial_reason")
 
         st.number_input(
             "High severity threshold",
@@ -961,7 +1084,7 @@ def main() -> None:
 
         st.divider()
 
-        render_geographic_concentration(dff)
+        render_operational_kpis(dff, sev_thresh)
 
         st.divider()
 
