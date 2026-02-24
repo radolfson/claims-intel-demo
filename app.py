@@ -965,7 +965,7 @@ def render_metric_rolodex_accident_year(dff: pd.DataFrame, sev_thresh: float) ->
 # Main
 # ============================================================
 def main() -> None:
-    st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide")
+    st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide", initial_sidebar_state="expanded")
 
     # ============================================================
     # Reliable fixed panels:
@@ -1004,6 +1004,27 @@ def main() -> None:
             overflow-y: auto;
             overscroll-behavior: contain;
           }
+
+
+          /* Force sidebar to behave like a fixed right rail (Streamlit renders it on the left by default) */
+          section[data-testid="stSidebar"]{
+            position: fixed !important;
+            top: 0 !important;
+            bottom: 0 !important;
+            right: 0 !important;
+            left: auto !important;
+            transform: none !important;
+            z-index: 100 !important;
+          }
+
+          /* Remove the collapse/expand control entirely */
+          [data-testid="collapsedControl"]{ display: none !important; }
+          button[data-testid="stSidebarCollapseButton"]{ display: none !important; }
+          button[title="Close sidebar"]{ display: none !important; }
+          button[title="Open sidebar"]{ display: none !important; }
+
+          /* In some Streamlit builds the control is an <a> */
+          a[title="Open sidebar"], a[title="Close sidebar"]{ display: none !important; }
 
           /* Fixed left headlines panel */
           #left-headlines-panel{
