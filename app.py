@@ -522,7 +522,7 @@ def build_headline_story(dff: pd.DataFrame, sev_thresh: float) -> list[str]:
 
 
 def render_headlines_ribbon(dff: pd.DataFrame, sev_thresh: float) -> None:
-    st.markdown("### Today’s Headlines")
+    st.markdown("<div class='headline-title'>Today’s Headlines</div>", unsafe_allow_html=True)
     bullets = build_headline_story(dff, sev_thresh)
 
     for b in bullets:
@@ -579,40 +579,42 @@ def render_kpi_row(dff: pd.DataFrame, sev_thresh: float) -> None:
 def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
     st.markdown("### Trends")
     roll = monthly_rollup(dff, sev_thresh)
+
+    # Only show the most recent period (demo request): start of 2025 onward
+    roll = roll.sort_values("trend_month")
+    roll = roll[roll["trend_month"] >= pd.Timestamp("2025-01-01")]
+
     if roll.empty or roll["trend_month"].nunique() < 2:
-        st.caption("Not enough monthly history to show trends (need 2+ months).")
+        st.caption("Not enough monthly history to show trends since 2025 (need 2+ months).")
         return
 
-    roll = roll.sort_values("trend_month")
-
     metrics = [
-        ("open_features", "Open Features", False),
         ("total_incurred", "Total Incurred", True),
         ("paid", "Paid", True),
         ("outstanding", "Outstanding", True),
         ("high_sev", "High Severity Features", False),
     ]
 
-    stat_cols = st.columns(5)
-    for idx, (col, label, is_money) in enumerate(metrics):
+    stat_cols = st.columns(4)
+    for i, (col, label, is_money) in enumerate(metrics):
         curr, prev = last_two_months(roll, col)
         delta = pct_change(curr or 0, prev or 0) if prev is not None else None
         display_val = fmt_money_compact(curr) if is_money else fmt_int(curr)
         display_delta = None if delta is None else f"{delta:+.1f}%"
-        stat_cols[idx].metric(label, display_val, display_delta)
+        stat_cols[i].metric(label, display_val, display_delta)
 
     st.divider()
 
-    def line(metric_col: str, title: str, height: int = 340) -> None:
+    def line(metric_col: str, title: str, height: int = 360) -> None:
         vals = pd.to_numeric(roll[metric_col], errors="coerce").fillna(0.0)
         vmin = float(vals.min())
         vmax = float(vals.max())
 
-        # Tighten axis so trends are readable (but don't lie with a hard zero)
+        # Tighten axis so trends are readable (but don't force a hard zero)
         if vmin == vmax:
             pad = 1.0 if vmax == 0 else abs(vmax) * 0.05
         else:
-            pad = (vmax - vmin) * 0.10
+            pad = (vmax - vmin) * 0.15
 
         domain = [vmin - pad, vmax + pad]
 
@@ -632,19 +634,10 @@ def render_trend_section(dff: pd.DataFrame, sev_thresh: float) -> None:
             use_container_width=True,
         )
 
-    # If Open Features is truly flat, skip the chart (still shown as KPI above and in Rolodex).
-    show_open_chart = roll["open_features"].nunique(dropna=False) > 1
-
-    r1 = st.columns(3)
+    r1 = st.columns(2)
     with r1[0]:
-        if show_open_chart:
-            line("open_features", "Open Features")
-        else:
-            st.caption("Open Features")
-            st.info("Open Features are flat across months in this selection, so the chart is hidden.")
-    with r1[1]:
         line("total_incurred", "Total Incurred ($)")
-    with r1[2]:
+    with r1[1]:
         line("paid", "Paid ($)")
 
     r2 = st.columns(2)
@@ -979,17 +972,24 @@ def main() -> None:
           }
 
           /* Give the page enough breathing room so the title never gets clipped */
-          .block-container { padding-top: 3.25rem; }
+          .block-container { padding-top: 4.5rem; }
 
           /* Headlines: readable, separated, consistent */
+          .headline-title{
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin: 0.25rem 0 0.75rem 0;
+            color: #102A43;
+          }
+
           .headline-box{
             background: #F3F6FA;
             border-left: 6px solid #1F4E79;
             padding: 0.85rem 0.9rem;
             margin: 0.75rem 0;
             border-radius: 10px;
-            font-size: 0.95rem;
-            line-height: 1.35;
+            font-size: 1.05rem;
+            line-height: 1.5;
             color: #102A43;
           }
         </style>
@@ -1067,12 +1067,12 @@ def main() -> None:
         with mast[0]:
             logo_path = "narslogo.jpg"
             if os.path.exists(logo_path):
-                st.image(logo_path, width=150)
+                st.image(logo_path, width=210)
         with mast[1]:
             st.markdown(
                 """
                 <div style="line-height:1.05">
-                  <div style="font-size:34px; font-weight:700;">Claims Intelligence – Daily Summary</div>
+                  <div style="font-size:50px; font-weight:800; margin-top:0.25rem;">Claims Intelligence – Daily Summary</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1080,7 +1080,8 @@ def main() -> None:
             as_of = "Latest"
             if dff["report_date"].notna().any():
                 as_of = str(dff["report_date"].max().date())
-            st.markdown(f"**As of:** {as_of}")
+            st.markdown(f"<div style='font-size:18px; margin-top:0.35rem;'><b>As of:</b> {as_of}</div>", unsafe_allow_html=True)
+            st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
 
         st.divider()
 
