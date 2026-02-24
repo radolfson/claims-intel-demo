@@ -1063,25 +1063,39 @@ def main() -> None:
     # Main content
     with main_col:
         # Newspaper-style masthead (aligned left within main content)
-        mast = st.columns([0.16, 0.84], vertical_alignment="center")
-        with mast[0]:
-            logo_path = "narslogo.jpg"
-            if os.path.exists(logo_path):
-                st.image(logo_path, width=210)
-        with mast[1]:
-            st.markdown(
-                """
-                <div style="line-height:1.05">
-                  <div style="font-size:50px; font-weight:800; margin-top:0.25rem;">Claims Intelligence – Daily Summary</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            as_of = "Latest"
-            if dff["report_date"].notna().any():
-                as_of = str(dff["report_date"].max().date())
-            st.markdown(f"<div style='font-size:18px; margin-top:0.35rem;'><b>As of:</b> {as_of}</div>", unsafe_allow_html=True)
-            st.markdown("<div style='height:0.75rem'></div>", unsafe_allow_html=True)
+   mast = st.columns([0.22, 0.78], vertical_alignment="center")
+
+with mast[0]:
+    logo_path = "narslogo.jpg"
+    if os.path.exists(logo_path):
+        st.image(logo_path, width=240)  # larger logo
+
+with mast[1]:
+    st.markdown(
+        """
+        <div style="line-height:1.1; padding-top:10px;">
+          <div style="font-size:30px; font-weight:600; letter-spacing:0.5px;">
+            Claims Intelligence – Daily Summary
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    as_of = "Latest"
+    if dff["report_date"].notna().any():
+        as_of = str(dff["report_date"].max().date())
+
+    st.markdown(
+        f"""
+        <div style="font-size:16px; margin-top:6px;">
+            <strong>As of:</strong> {as_of}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
 
         st.divider()
 
