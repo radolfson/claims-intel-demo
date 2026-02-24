@@ -984,14 +984,24 @@ def main() -> None:
             position: sticky;
             top: var(--stickyTop);
             align-self: flex-start;
-            max-height: calc(100vh - var(--stickyTop) - 1rem);
-            overflow-y: auto;
             background: white;
             z-index: 2;
             padding-right: 0.25rem;
           }
 
-          /* Give the page enough breathing room so the title never gets clipped */
+          /* Headlines: stay put, no independent scroll (page scroll only) */
+          .sticky-headlines{
+            max-height: none;
+            overflow: visible;
+          }
+
+          /* Filters: stay put AND scroll internally without dragging the page */
+          .sticky-filters{
+            max-height: calc(100vh - var(--stickyTop) - 1rem);
+            overflow-y: auto;
+            overscroll-behavior: contain;
+          }
+/* Give the page enough breathing room so the title never gets clipped */
           .block-container { padding-top: 4.5rem; }
 
           /* Headlines: readable, separated, consistent */
@@ -1033,7 +1043,7 @@ def main() -> None:
 
     # Filters (right sticky)
     with filter_col:
-        st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
+        st.markdown('<div class="sticky-col sticky-filters">', unsafe_allow_html=True)
         st.markdown("### Filters")
 
         states = ["All States"] + safe_list(df_std["state"])
@@ -1076,7 +1086,7 @@ def main() -> None:
 
     # Headlines ribbon (left sticky)
     with ribbon_col:
-        st.markdown('<div class="sticky-col">', unsafe_allow_html=True)
+        st.markdown('<div class="sticky-col sticky-headlines">', unsafe_allow_html=True)
         render_headlines_ribbon(dff, sev_thresh)
         st.markdown("</div>", unsafe_allow_html=True)
 
