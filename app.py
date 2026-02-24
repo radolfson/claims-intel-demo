@@ -862,40 +862,102 @@ def _dashboard_url_fallback() -> str:
     return "https://nars-demo.streamlit.app"
 
 
-def build_email_html(
-    as_of: str,
-    headlines: list[str],
-    dashboard_url: str,
-) -> str:
-    # Clean + punchy email layout: title, 4 cards, CTA button.
-    cards = ""
+def build_email_html(as_of: str, headlines: list[str], dashboard_url: str) -> str:
+
+    rows = ""
     for h in headlines[:4]:
-        cards += f"""
-        <div style="background:#F3F6FA;border-left:6px solid #1F4E79;border-radius:12px;padding:14px 14px;margin:10px 0;color:#102A43;line-height:1.5;font-size:15px;">
-          {h}
-        </div>
+        rows += f"""
+        <tr>
+            <td style="padding:14px 18px; border-left:4px solid #1F4E79; 
+                       background-color:#F4F6F8; 
+                       font-family:Arial, sans-serif;
+                       font-size:14px; line-height:20px; color:#102A43;">
+                {h}
+            </td>
+        </tr>
+        <tr><td height="10"></td></tr>
         """
 
     html = f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;max-width:720px;margin:0 auto;padding:18px;color:#102A43;">
-      <div style="font-size:22px;font-weight:700;margin-bottom:4px;">Cover Whale Daily, Powered by NARS</div>
-      <div style="font-size:14px;color:#52606D;margin-bottom:18px;"><b>As of:</b> {as_of}</div>
+    <!DOCTYPE html>
+    <html>
+    <body style="margin:0; padding:0; background-color:#ffffff;">
 
-      <div style="font-size:16px;font-weight:700;margin:8px 0 10px 0;">Today’s Headlines</div>
-      {cards}
+    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+            <td align="center">
 
-      <div style="margin-top:18px;padding-top:16px;border-top:1px solid rgba(16,42,67,0.12);">
-        <a href="{dashboard_url}" style="display:inline-block;background:#1F4E79;color:#ffffff;text-decoration:none;padding:12px 16px;border-radius:10px;font-weight:700;">
-          Open Dashboard
-        </a>
-        <div style="font-size:12px;color:#7B8794;margin-top:10px;">
-          If the button doesn't work, copy/paste: <span style="color:#1F4E79;">{dashboard_url}</span>
-        </div>
-      </div>
-    </div>
+                <table width="620" cellpadding="0" cellspacing="0" border="0"
+                       style="font-family:Arial, sans-serif; color:#102A43;">
+
+                    <tr>
+                        <td style="padding:20px 0 5px 0; font-size:22px; font-weight:bold;">
+                            Cover Whale Daily, Powered by NARS
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="font-size:13px; color:#52606D; padding-bottom:20px;">
+                            <strong>As of:</strong> {as_of}
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="font-size:16px; font-weight:bold; padding-bottom:10px;">
+                            Today’s Headlines
+                        </td>
+                    </tr>
+
+                    {rows}
+
+                    <tr><td height="25"></td></tr>
+
+                    <!-- BUTTON (Outlook Safe) -->
+                    <tr>
+                        <td align="center">
+                            <table cellpadding="0" cellspacing="0" border="0">
+                                <tr>
+                                    <td bgcolor="#1F4E79"
+                                        style="padding:12px 24px;
+                                               font-family:Arial, sans-serif;
+                                               font-size:14px;
+                                               color:#ffffff;
+                                               text-align:center;">
+                                        <a href="{dashboard_url}"
+                                           style="color:#ffffff;
+                                                  text-decoration:none;
+                                                  display:inline-block;">
+                                           Open Dashboard
+                                        </a>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <tr><td height="20"></td></tr>
+
+                    <tr>
+                        <td style="font-size:12px; color:#7B8794; word-break:break-all;">
+                            If the button does not work, copy and paste:
+                            <br>
+                            {dashboard_url}
+                        </td>
+                    </tr>
+
+                    <tr><td height="30"></td></tr>
+
+                </table>
+
+            </td>
+        </tr>
+    </table>
+
+    </body>
+    </html>
     """
-    return html
 
+    return html
 
 def build_email_text(as_of: str, headlines: list[str], dashboard_url: str) -> str:
     lines = [
