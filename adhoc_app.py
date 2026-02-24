@@ -21,14 +21,14 @@ def _fmt_money(x: float) -> str:
     try:
         return "${:,.0f}".format(float(x))
     except Exception:
-        return ""
+        return "—"
 
 
 def load_data() -> tuple[pd.DataFrame, str]:
     """
     Priority:
       1) User-uploaded CSV
-      2) Local demo CSV in repo (demo_features_latest.csv)
+      2) Local demo CSV in repo folder (demo_features_latest.csv)
     """
     uploaded = st.session_state.get("_uploaded_file")
     if uploaded is not None:
@@ -46,19 +46,21 @@ def load_data() -> tuple[pd.DataFrame, str]:
 def standardize(df: pd.DataFrame) -> pd.DataFrame:
     dff = df.copy()
 
-    # Common date columns (best-effort)
+    # Dates (best-effort)
     for c in ["report_date", "trend_month", "feature_created_date", "loss_date", "accident_date"]:
         if c in dff.columns:
             dff[c] = _safe_dt(dff[c])
 
-    # Common numeric columns (best-effort)
+    # Numerics (best-effort)
     for c in ["incurred_amount", "paid_amount", "outstanding_amount", "reserve_amount", "total_incurred"]:
         if c in dff.columns:
             dff[c] = pd.to_numeric(dff[c], errors="coerce")
 
-    # Normalize some common categorical columns if present
-    for c in ["state", "coverage_type", "feature_status", "line_of_business", "cause_of_loss", "adjuster",
-              "vendor_name", "defense_firm", "denial_reason"]:
+    # Categoricals (best-effort)
+    for c in [
+        "state", "coverage_type", "feature_status", "line_of_business", "cause_of_loss", "adjuster",
+        "vendor_name", "defense_firm", "denial_reason"
+    ]:
         if c in dff.columns:
             dff[c] = dff[c].astype(str).replace({"nan": None, "None": None})
 
@@ -70,9 +72,11 @@ def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
 
     def _apply(col, val):
         nonlocal dff
-        if col in dff.columns and val not in (None, "All", "All States", "All Years", "All Coverages", "All Lines",
-                                             "All Adjusters", "All Statuses", "All Causes", "All Vendors", "All Firms",
-                                             "All Reasons"):
+        if col in dff.columns and val not in (
+            None, "All", "All States", "All Years", "All Coverages", "All Lines",
+            "All Adjusters", "All Statuses", "All Causes", "All Vendors", "All Firms",
+            "All Reasons"
+        ):
             dff = dff[dff[col] == val]
 
     _apply("state", f["state"])
@@ -94,13 +98,17 @@ def apply_filters(df: pd.DataFrame, f: dict) -> pd.DataFrame:
                 lit_col = cand
                 break
         if lit_col is not None:
+            lit_vals = dff[lit_col].astype(str).str.lower()
+            is_lit = lit_vals.isin(["1", "true", "yes", "y", "litigated"])
             if f["litigation"] == "Litigated":
-                dff = dff[dff[lit_col].astype(str).str.lower().isin(["1", "true", "yes", "y", "litigated"])]
-            elif f["litigation"] == "Not Litigated":
-                dff = dff[~dff[lit_col].astype(str).str.lower().isin(["1", "true", "yes", "y", "litigated"])]
+                dff = dff[is_lit]
+            else:
+                dff = dff[~is_lit]
 
     # Severity threshold (uses incurred_amount if present, else total_incurred)
-    sev_col = "incurred_amount" if "incurred_amount" in dff.columns else ("total_incurred" if "total_incurred" in dff.columns else None)
+    sev_col = "incurred_amount" if "incurred_amount" in dff.columns else (
+        "total_incurred" if "total_incurred" in dff.columns else None
+    )
     if sev_col is not None:
         dff = dff[pd.to_numeric(dff[sev_col], errors="coerce").fillna(0) >= f["sev_thresh"]]
 
@@ -128,7 +136,6 @@ def pick_columns(df: pd.DataFrame) -> list[str]:
         "feature_created_date",
     ]
     cols = [c for c in preferred if c in df.columns]
-    # Add a couple fallbacks if nothing matches
     if not cols:
         cols = df.columns.tolist()[:12]
     return cols
@@ -146,7 +153,7 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Run a filtered, exportable loss run on demand. Because humans love buttons.")
+    st.caption("Run a filtered, exportable loss run on demand. Humans love buttons.")
 
     # Upload control
     with st.expander("Data Source", expanded=False):
@@ -154,11 +161,11 @@ def main() -> None:
         if up is not None:
             st.session_state["_uploaded_file"] = up
             st.success("Using uploaded CSV for this session.")
-        st.markdown("- If no upload is provided, the app will look for `demo_features_latest.csv` in the app folder.")
+        st.markdown("- If no upload is provided, the app will look for `demo_features_latest.csv` in this repo folder.")
 
     df, src = load_data()
     if df.empty:
-        st.error("No data loaded. Upload a CSV or add `demo_features_latest.csv` next to this app.")
+        st.error("No data loaded. Upload a CSV or add `demo_features_latest.csv` next to this app file.")
         st.stop()
 
     df = standardize(df)
@@ -169,7 +176,10 @@ def main() -> None:
     def _vals(col, label_all):
         if col not in df.columns:
             return [label_all]
-        vals = sorted([v for v in df[col].dropna().unique().tolist() if str(v) not in ("nan", "None")])
+        vals = sorted([
+            v for v in df[col].dropna().unique().tolist()
+            if str(v) not in ("nan", "None")
+        ])
         return [label_all] + vals
 
     f = {
@@ -184,7 +194,13 @@ def main() -> None:
         "vendor_name": st.sidebar.selectbox("Vendor", _vals("vendor_name", "All Vendors")),
         "defense_firm": st.sidebar.selectbox("Defense Firm", _vals("defense_firm", "All Firms")),
         "denial_reason": st.sidebar.selectbox("Denial Reason", _vals("denial_reason", "All Reasons")),
-        "sev_thresh": st.sidebar.number_input("Severity threshold", min_value=0, max_value=2_000_000, step=25_000, value=250_000),
+        "sev_thresh": st.sidebar.number_input(
+            "Severity threshold",
+            min_value=0,
+            max_value=2_000_000,
+            step=25_000,
+            value=250_000,
+        ),
     }
 
     st.sidebar.divider()
@@ -198,7 +214,10 @@ def main() -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Data source", src)
     c2.metric("Rows after filters", f"{len(base):,}")
-    sev_col = "incurred_amount" if "incurred_amount" in base.columns else ("total_incurred" if "total_incurred" in base.columns else None)
+
+    sev_col = "incurred_amount" if "incurred_amount" in base.columns else (
+        "total_incurred" if "total_incurred" in base.columns else None
+    )
     if sev_col is not None and not base.empty:
         c3.metric("Avg severity", _fmt_money(base[sev_col].fillna(0).mean()))
         c4.metric("Max severity", _fmt_money(base[sev_col].fillna(0).max()))
@@ -209,11 +228,10 @@ def main() -> None:
     st.divider()
 
     # Run button
-    run_col1, run_col2, run_col3 = st.columns([1, 2, 2])
+    run_col1, _, _ = st.columns([1, 2, 2])
     with run_col1:
         run = st.button("Run Loss Run", type="primary", use_container_width=True)
 
-    # Persist last run results
     if run:
         if base.empty:
             st.warning("No rows match the current filters.")
@@ -248,25 +266,20 @@ def main() -> None:
             f"Returned **{last['rows_returned']}** row(s) (requested {last['rows_requested']})"
         )
 
-        # Show filters used (collapsed)
         with st.expander("Selection Criteria (filters used)", expanded=False):
             st.json(last["filters"])
 
         out_df = last["data"]
-
         st.dataframe(out_df, use_container_width=True, height=520)
 
-        csv_bytes = df_to_csv_bytes(out_df)
         st.download_button(
             "Download CSV",
-            data=csv_bytes,
+            data=df_to_csv_bytes(out_df),
             file_name=f"{last['run_id']}_loss_run.csv",
             mime="text/csv",
-            use_container_width=False,
         )
 
-        st.caption("Tip: switch 'Randomization' to 'New each run' and hit Run again to re-roll.")
-
+        st.caption("Tip: switch Randomization to “New each run” and hit Run again to re-roll.")
     else:
         st.info("Set filters (optional) and click **Run Loss Run** to generate an exportable sample.")
 
