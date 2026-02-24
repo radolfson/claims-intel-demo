@@ -125,8 +125,16 @@ mast = st.columns([0.2, 0.8], vertical_alignment="center")
 
 with mast[0]:
     if os.path.exists("narslogo.jpg"):
-        st.image("narslogo.jpg", width=220)
-
+        st.markdown(
+            """
+            <div style="padding-top:12px; padding-bottom:8px;">
+                <img src="data:image/jpg;base64,{img}" width="260">
+            </div>
+            """.format(
+                img=open("narslogo.jpg", "rb").read().encode("base64").decode()
+            ),
+            unsafe_allow_html=True,
+        )
 with mast[1]:
     st.markdown(
         """
