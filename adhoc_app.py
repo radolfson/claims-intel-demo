@@ -1,6 +1,6 @@
-# adhoc_app.py
 import os
 from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -18,6 +18,10 @@ st.markdown(
     """
 <style>
 .block-container { padding-top: 1.0rem; padding-bottom: 2.0rem; max-width: 1400px; }
+
+/* Give the top area more vertical breathing room so logos never look clipped */
+.cw-mast { padding: 0.25rem 0 0.75rem 0; }
+
 .cw-card {
   background: #FFFFFF;
   border: 1px solid rgba(49, 51, 63, 0.12);
@@ -53,6 +57,7 @@ st.markdown(
 # -----------------------------
 # Helpers
 # -----------------------------
+
 def _money(x):
     try:
         return float(x)
@@ -67,89 +72,8 @@ def _fmt_money(v):
         return "—"
 
 
-def _col_exists(df: pd.DataFrame, col: str) -> bool:
-    return col in df.columns and df[col].notna().any()
-
-
-def load_claims_table() -> pd.DataFrame:
-    """
-    Prefer: demo_features_latest.csv (same repo) -> transform to a claim-like output.
-    Fallback: generate synthetic claim list so the demo always works.
-    """
-    path = "demo_features_latest.csv"
-    if os.path.exists(path):
-        df = pd.read_csv(path)
-
-        # Normalize dates if present
-        for c in ["report_date", "loss_date", "open_date", "close_date", "reserve_open_date"]:
-            if c in df.columns:
-                df[c] = pd.to_datetime(df[c], errors="coerce")
-
-        # Try to map to a claim-list output (claim-level)
-        # We'll build a standard output schema even if some fields are missing.
-        out = pd.DataFrame()
-        out["Client"] = df.get("client_name", df.get("client", "Cover Whale"))
-        out["Policy Number"] = df.get("policy_number", df.get("policy_id", df.get("policy", "—")))
-        out["Claim Number"] = df.get("claim_number", df.get("claim_id", df.get("claim", "—")))
-        out["Feature Key"] = df.get("feature_key", df.get("feature_id", "—"))
-        out["State"] = df.get("state", "—")
-        out["Coverage"] = df.get("coverage_type", df.get("coverage_code", df.get("coverage", "—")))
-        out["Loss Date"] = df.get("loss_date", df.get("accident_date", pd.NaT))
-        out["Open Date"] = df.get("reserve_open_date", df.get("open_date", pd.NaT))
-        out["Status"] = df.get("feature_status", df.get("claim_status", "—"))
-        out["Adjuster"] = df.get("adjuster", df.get("adjuster_name", "—"))
-        out["Defense Firm"] = df.get("defense_firm", df.get("law_firm", "—"))
-        out["Denial Reason"] = df.get("denial_reason", "—")
-
-        # Financials
-        out["Paid"] = df.get("paid_amount", df.get("paid", 0)).apply(_money)
-        out["Outstanding"] = df.get("outstanding_amount", df.get("outstanding", 0)).apply(_money)
-        out["Incurred"] = df.get("incurred_amount", df.get("total_incurred", out["Paid"] + out["Outstanding"])).apply(_money)
-
-        # If you want the delivered output to feel like a “loss run”, keep it clean:
-        out = out.replace({np.nan: "—"})
-        return out
-
-    # -----------------------------
-    # Fallback synthetic data
-    # -----------------------------
-    rng = np.random.default_rng(42)
-    n = 600  # "big list" feel
-    today = pd.Timestamp.today().normalize()
-
-    clients = ["FLORIDA HOSPITAL SELF INSURANCE FUND", "LAUNCH ENVIRONMENTAL", "COVER WHALE (DEMO)"]
-    coverages = ["WC-IND", "AUTO", "GL", "EXCESS"]
-    states = ["FL", "TX", "CA", "IL", "GA", "NC", "NJ"]
-    denial_reasons = ["None", "Late Notice", "Coverage Exclusion", "Policy Lapse", "MCS90"]
-
-    loss_dates = pd.to_datetime(today - pd.to_timedelta(rng.integers(30, 365 * 5, size=n), unit="D"))
-    open_dates = loss_dates + pd.to_timedelta(rng.integers(0, 30, size=n), unit="D")
-
-    paid = rng.gamma(shape=2.0, scale=15000, size=n)
-    paid[rng.random(n) < 0.35] = 0  # many claims have no paid yet
-    outstanding = rng.gamma(shape=2.0, scale=12000, size=n)
-    incurred = paid + outstanding
-
-    df = pd.DataFrame(
-        {
-            "Client": rng.choice(clients, size=n, p=[0.55, 0.25, 0.20]),
-            "Policy Number": [f"POL-{rng.integers(100000, 999999)}" for _ in range(n)],
-            "Claim Number": [f"CLM-{rng.integers(100000, 999999)}" for _ in range(n)],
-            "Feature Key": [f"F-{rng.integers(2021, 2026)}-{rng.integers(10000, 99999)}" for _ in range(n)],
-            "State": rng.choice(states, size=n),
-            "Coverage": rng.choice(coverages, size=n),
-            "Loss Date": loss_dates,
-            "Open Date": open_dates,
-            "Status": rng.choice(["OPEN", "CLOSED"], size=n, p=[0.72, 0.28]),
-            "Adjuster": rng.choice(["All Adjusters", "J. Smith", "A. Patel", "M. Chen", "R. Garcia"], size=n),
-            "Defense Firm": rng.choice(["All Firms", "Smith & Cole", "Parker LLP", "Hart & Gray", "None"], size=n),
-            "Denial Reason": rng.choice(denial_reasons, size=n, p=[0.65, 0.10, 0.10, 0.10, 0.05]),
-            "Paid": paid,
-            "Outstanding": outstanding,
-            "Incurred": incurred,
-        }
-    )
-    return df
+def _safe_dt(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce")
 
 
 def card(col, label, value):
@@ -164,18 +88,144 @@ def card(col, label, value):
     )
 
 
+def load_claims_table() -> pd.DataFrame:
+    """Load claim-level rows.
+
+    Prefer demo_features_latest.csv (same repo as dashboard).
+    If the CSV is missing OR if we can't derive usable dates, fall back to synthetic rows.
+    """
+
+    csv_path = "demo_features_latest.csv"
+
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+
+        # Parse candidate date columns we might need
+        for c in ["report_date", "loss_date", "accident_date", "open_date", "close_date", "reserve_open_date"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+
+        out = pd.DataFrame()
+        out["Client"] = df.get("client_name", df.get("client", "COVER WHALE (DEMO)"))
+        out["Policy Number"] = df.get("policy_number", df.get("policy_id", df.get("policy", "—")))
+        out["Claim Number"] = df.get("claim_number", df.get("claim_id", df.get("claim", "—")))
+        out["Feature Key"] = df.get("feature_key", df.get("feature_id", "—"))
+        out["State"] = df.get("state", "—")
+        out["Coverage"] = df.get("coverage_type", df.get("coverage_code", df.get("coverage", "—")))
+
+        # Try to derive Loss Date / Open Date in a resilient way.
+        # Some demo extracts won't have loss_date; use accident_date; else report_date.
+        loss = df.get("loss_date", None)
+        if loss is None:
+            loss = df.get("accident_date", None)
+        if loss is None:
+            loss = df.get("report_date", None)
+
+        opn = df.get("reserve_open_date", None)
+        if opn is None:
+            opn = df.get("open_date", None)
+        if opn is None:
+            opn = df.get("report_date", None)
+
+        out["Loss Date"] = pd.to_datetime(loss, errors="coerce")
+        out["Open Date"] = pd.to_datetime(opn, errors="coerce")
+
+        out["Status"] = df.get("feature_status", df.get("claim_status", "—"))
+        out["Adjuster"] = df.get("adjuster", df.get("adjuster_name", "—"))
+        out["Defense Firm"] = df.get("defense_firm", df.get("law_firm", "—"))
+        out["Denial Reason"] = df.get("denial_reason", "—")
+
+        out["Paid"] = df.get("paid_amount", df.get("paid", 0)).apply(_money)
+        out["Outstanding"] = df.get("outstanding_amount", df.get("outstanding", 0)).apply(_money)
+
+        if "incurred_amount" in df.columns:
+            out["Incurred"] = df["incurred_amount"].apply(_money)
+        elif "total_incurred" in df.columns:
+            out["Incurred"] = df["total_incurred"].apply(_money)
+        else:
+            out["Incurred"] = out["Paid"] + out["Outstanding"]
+
+        # If dates are completely missing/NaT, create plausible ones so the demo isn't empty.
+        if out["Loss Date"].isna().all() or out["Open Date"].isna().all():
+            # Use report_date if present, otherwise synthesize
+            base = pd.to_datetime(df.get("report_date", pd.Timestamp.today()), errors="coerce")
+            if isinstance(base, pd.Series) and base.notna().any():
+                base = base.fillna(base.max())
+            else:
+                base = pd.Series([pd.Timestamp.today()] * len(df))
+
+            rng = np.random.default_rng(42)
+            # Backdate loss 0-5 years, open 0-30 days after loss
+            loss_dates = pd.to_datetime(base) - pd.to_timedelta(rng.integers(30, 365 * 5, size=len(out)), unit="D")
+            open_dates = loss_dates + pd.to_timedelta(rng.integers(0, 30, size=len(out)), unit="D")
+            out["Loss Date"] = loss_dates
+            out["Open Date"] = open_dates
+
+        out = out.replace({np.nan: "—"})
+        return out
+
+    # -----------------------------
+    # Fallback synthetic data
+    # -----------------------------
+    rng = np.random.default_rng(42)
+    n = 750  # big list vibe
+    today = pd.Timestamp.today().normalize()
+
+    clients = [
+        "FLORIDA HOSPITAL SELF INSURANCE FUND",
+        "LAUNCH ENVIRONMENTAL",
+        "COVER WHALE (DEMO)",
+    ]
+    coverages = ["WC-IND", "AUTO", "GL", "EXCESS"]
+    states = ["FL", "TX", "CA", "IL", "GA", "NC", "NJ"]
+    denial_reasons = ["None", "Late Notice", "Coverage Exclusion", "Policy Lapse", "MCS90"]
+
+    loss_dates = pd.to_datetime(today - pd.to_timedelta(rng.integers(30, 365 * 5, size=n), unit="D"))
+    open_dates = loss_dates + pd.to_timedelta(rng.integers(0, 30, size=n), unit="D")
+
+    paid = rng.gamma(shape=2.0, scale=15000, size=n)
+    paid[rng.random(n) < 0.35] = 0
+    outstanding = rng.gamma(shape=2.0, scale=12000, size=n)
+    incurred = paid + outstanding
+
+    return pd.DataFrame(
+        {
+            "Client": rng.choice(clients, size=n, p=[0.55, 0.25, 0.20]),
+            "Policy Number": [f"POL-{rng.integers(100000, 999999)}" for _ in range(n)],
+            "Claim Number": [f"CLM-{rng.integers(100000, 999999)}" for _ in range(n)],
+            "Feature Key": [f"F-{rng.integers(2021, 2026)}-{rng.integers(10000, 99999)}" for _ in range(n)],
+            "State": rng.choice(states, size=n),
+            "Coverage": rng.choice(coverages, size=n),
+            "Loss Date": loss_dates,
+            "Open Date": open_dates,
+            "Status": rng.choice(["OPEN", "CLOSED"], size=n, p=[0.72, 0.28]),
+            "Adjuster": rng.choice(["J. Smith", "A. Patel", "M. Chen", "R. Garcia"], size=n),
+            "Defense Firm": rng.choice(["Smith & Cole", "Parker LLP", "Hart & Gray", "None"], size=n),
+            "Denial Reason": rng.choice(denial_reasons, size=n, p=[0.65, 0.10, 0.10, 0.10, 0.05]),
+            "Paid": paid,
+            "Outstanding": outstanding,
+            "Incurred": incurred,
+        }
+    )
+
+
 # -----------------------------
-# Masthead
+# Masthead (fix clipped logo)
 # -----------------------------
-mast = st.columns([0.18, 0.82], vertical_alignment="center")
+st.markdown('<div class="cw-mast">', unsafe_allow_html=True)
+
+mast = st.columns([0.20, 0.80], vertical_alignment="center")
 with mast[0]:
     logo_path = "narslogo.jpg"
     if os.path.exists(logo_path):
-        st.image(logo_path, width=210)
+        # Use a slightly smaller width and add a little top padding
+        st.markdown("<div style='padding-top:6px;'></div>", unsafe_allow_html=True)
+        st.image(logo_path, width=230)
+
 with mast[1]:
     st.markdown(
         """
-        <div style="line-height:1.05;">
+        <div style="line-height:1.06; padding-top:6px;">
           <div style="font-size:30px; font-weight:800; letter-spacing:0.2px;">
             Cover Whale Ad Hoc Delivery Preview
           </div>
@@ -187,104 +237,64 @@ with mast[1]:
         unsafe_allow_html=True,
     )
 
+st.markdown("</div>", unsafe_allow_html=True)
+
 st.divider()
 
 # -----------------------------
-# Load data (no uploader)
+# Data (always present)
 # -----------------------------
 df = load_claims_table()
 
-# Normalize date types
+# Ensure dates are datetime
 for c in ["Loss Date", "Open Date"]:
     if c in df.columns:
         df[c] = pd.to_datetime(df[c], errors="coerce")
 
 # -----------------------------
-# Filters (simple + professional)
+# Delivery Summary (keep it, kill Request Context)
 # -----------------------------
-st.markdown("<div class='cw-h2'>Request Context</div>", unsafe_allow_html=True)
-c1, c2, c3, c4 = st.columns([0.30, 0.25, 0.25, 0.20], gap="medium")
-
-client_vals = sorted(df["Client"].dropna().astype(str).unique().tolist()) if "Client" in df.columns else []
-policy_vals = sorted(df["Policy Number"].dropna().astype(str).unique().tolist())[:500] if "Policy Number" in df.columns else []
-
-with c1:
-    client_sel = st.selectbox("Client", ["All Clients"] + client_vals, index=0)
-with c2:
-    policy_sel = st.selectbox("Policy (optional)", ["All Policies"] + policy_vals, index=0)
-with c3:
-    out_type = st.selectbox("Output Type", ["Data Only (Excel)", "PDF", "CSV"], index=0)
-with c4:
-    priority = st.selectbox("Priority", ["Low", "Medium", "High"], index=1)
-
-# Date range filter
-min_date = df["Loss Date"].min() if "Loss Date" in df.columns else pd.NaT
-max_date = df["Loss Date"].max() if "Loss Date" in df.columns else pd.NaT
-if pd.isna(min_date) or pd.isna(max_date):
-    min_date = pd.Timestamp("2021-01-01")
-    max_date = pd.Timestamp.today().normalize()
-
-dcol1, dcol2 = st.columns([0.5, 0.5], gap="medium")
-with dcol1:
-    start_date = st.date_input("Loss Date Start", value=min_date.date())
-with dcol2:
-    end_date = st.date_input("Loss Date End", value=max_date.date())
-
-# Apply filters
-dff = df.copy()
-if client_sel != "All Clients":
-    dff = dff[dff["Client"] == client_sel]
-if policy_sel != "All Policies":
-    dff = dff[dff["Policy Number"] == policy_sel]
-
-if "Loss Date" in dff.columns:
-    dff = dff[
-        (pd.to_datetime(dff["Loss Date"], errors="coerce") >= pd.Timestamp(start_date))
-        & (pd.to_datetime(dff["Loss Date"], errors="coerce") <= pd.Timestamp(end_date))
-    ]
-
-# -----------------------------
-# Summary cards
-# -----------------------------
-st.divider()
 st.markdown("<div class='cw-h2'>Delivery Summary</div>", unsafe_allow_html=True)
 
+rows = len(df)
+paid_total = df["Paid"].sum() if "Paid" in df.columns else 0
+out_total = df["Outstanding"].sum() if "Outstanding" in df.columns else 0
+inc_total = df["Incurred"].sum() if "Incurred" in df.columns else 0
+
 k1, k2, k3, k4, k5 = st.columns(5, gap="medium")
-card(k1, "Rows Delivered", f"{len(dff):,}")
-card(k2, "Total Paid", _fmt_money(dff["Paid"].sum()) if "Paid" in dff.columns else "—")
-card(k3, "Total Outstanding", _fmt_money(dff["Outstanding"].sum()) if "Outstanding" in dff.columns else "—")
-card(k4, "Total Incurred", _fmt_money(dff["Incurred"].sum()) if "Incurred" in dff.columns else "—")
-card(k5, "Output", out_type)
+card(k1, "Rows Delivered", f"{rows:,}")
+card(k2, "Total Paid", _fmt_money(paid_total))
+card(k3, "Total Outstanding", _fmt_money(out_total))
+card(k4, "Total Incurred", _fmt_money(inc_total))
+card(k5, "Output", "Data Only (Excel)")
 
 st.markdown(
-    f"<div class='cw-muted'>This preview simulates the delivered file for an ad hoc request. "
-    f"It is formatted to match the look-and-feel of the executive dashboard.</div>",
+    "<div class='cw-muted'>This preview simulates the delivered file for an ad hoc request. "
+    "It is intentionally styled to match the executive dashboard.</div>",
     unsafe_allow_html=True,
 )
 
 # -----------------------------
-# Big list of claims (like the PDF vibe)
+# Big list of claims (like the PDF)
 # -----------------------------
 st.divider()
 st.markdown("<div class='cw-h2'>Loss Run Detail (Claim List)</div>", unsafe_allow_html=True)
 
-# Sort like a typical loss run output
-sort_cols = [c for c in ["Loss Date", "Open Date", "Incurred"] if c in dff.columns]
-if sort_cols:
-    dff = dff.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
+# Sort like a typical loss run: newest losses first, then highest incurred
+sort_by = [c for c in ["Loss Date", "Incurred"] if c in df.columns]
+if sort_by:
+    df = df.sort_values(by=sort_by, ascending=[False] * len(sort_by))
 
-# Display-friendly formatting
-display_df = dff.copy()
-
+# Display formatting
+show = df.copy()
 for c in ["Paid", "Outstanding", "Incurred"]:
-    if c in display_df.columns:
-        display_df[c] = display_df[c].apply(_fmt_money)
+    if c in show.columns:
+        show[c] = show[c].apply(_fmt_money)
 
 for c in ["Loss Date", "Open Date"]:
-    if c in display_df.columns:
-        display_df[c] = pd.to_datetime(display_df[c], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+    if c in show.columns:
+        show[c] = pd.to_datetime(show[c], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
 
-# Keep columns tight, like a real loss run export
 preferred_cols = [
     "Client",
     "Policy Number",
@@ -302,32 +312,29 @@ preferred_cols = [
     "Defense Firm",
     "Denial Reason",
 ]
-cols = [c for c in preferred_cols if c in display_df.columns]
-st.dataframe(display_df[cols], use_container_width=True, height=650, hide_index=True)
+cols = [c for c in preferred_cols if c in show.columns]
+
+st.dataframe(show[cols], use_container_width=True, height=700, hide_index=True)
 
 # -----------------------------
-# Download package (what client gets)
+# Download (what client receives)
 # -----------------------------
 st.divider()
 st.markdown("<div class='cw-h2'>Download</div>", unsafe_allow_html=True)
 
-# Raw export should not have formatted money strings
-export_df = dff.copy()
+export_df = df.copy()
+
+# Convert dates back to ISO for export (no NaT strings)
+for c in ["Loss Date", "Open Date"]:
+    if c in export_df.columns:
+        export_df[c] = pd.to_datetime(export_df[c], errors="coerce").dt.strftime("%Y-%m-%d")
+
 csv_bytes = export_df.to_csv(index=False).encode("utf-8")
 
-d1, d2 = st.columns([0.35, 0.65], gap="medium")
-with d1:
-    st.download_button(
-        label="Download Delivered File (CSV)",
-        data=csv_bytes,
-        file_name="loss_run_delivery.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-with d2:
-    st.markdown(
-        "<div class='cw-muted'>For the demo: this represents the data-only delivery file. "
-        "In production you’d attach Excel/PDF, but the preview and schema are what matter here.</div>",
-        unsafe_allow_html=True,
-    )
+st.download_button(
+    label="Download Delivered File (CSV)",
+    data=csv_bytes,
+    file_name="loss_run_delivery.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
