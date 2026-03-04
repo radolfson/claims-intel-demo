@@ -892,7 +892,7 @@ def build_email_html(as_of: str, headlines: list[str], dashboard_url: str) -> st
 
                     <tr>
                         <td style="padding:20px 0 5px 0; font-size:22px; font-weight:bold;">
-                            Cover Whale Daily, Powered by NARS
+                            Claims Intelligence Daily, Powered by NARS
                         </td>
                     </tr>
 
@@ -961,7 +961,7 @@ def build_email_html(as_of: str, headlines: list[str], dashboard_url: str) -> st
 
 def build_email_text(as_of: str, headlines: list[str], dashboard_url: str) -> str:
     lines = [
-        "Cover Whale Daily, Powered by NARS",
+        "Claims Intelligence Daily, Powered by NARS",
         f"As of: {as_of}",
         "",
         "Today's Headlines:",
@@ -1047,7 +1047,7 @@ def render_email_section(as_of: str, headlines: list[str]) -> None:
             return
 
         dashboard_url = _dashboard_url_fallback()
-        subject = f"Cover Whale Daily (As of {as_of})"
+        subject = f"Claims Intelligence Daily (As of {as_of})"
         html_body = build_email_html(as_of=as_of, headlines=headlines, dashboard_url=dashboard_url)
         text_body = build_email_text(as_of=as_of, headlines=headlines, dashboard_url=dashboard_url)
 
@@ -1068,7 +1068,7 @@ def render_email_section(as_of: str, headlines: list[str]) -> None:
 # Main
 # ============================================================
 def main() -> None:
-    st.set_page_config(page_title="Cover Whale Daily, Powered by NARS", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title="Claims Intelligence Daily, Powered by NARS", layout="wide", initial_sidebar_state="expanded")
 
     st.markdown(
         """
@@ -1232,7 +1232,7 @@ def main() -> None:
             """
             <div style="line-height:1.05; padding-top:6px;">
               <div style="font-size:30px; font-weight:650; letter-spacing:0.25px;">
-                Cover Whale Daily, Powered by NARS
+                Claims Intelligence Daily, Powered by NARS
               </div>
             </div>
             """,
